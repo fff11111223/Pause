@@ -20,6 +20,55 @@ mod.is_in_game = function()
 		and Managers.time:has_timer("game")
 end
 
+-- Check if currently inside the Inn/Keep/Lobby (including all seasonal event variations)
+mod.is_in_inn = function()
+	local transition = Managers.level_transition_handler
+	if not transition then
+		return false
+	end
+	local current_level = transition:get_current_level_key()
+	if not current_level then
+		return false
+	end
+	if current_level:find("inn_level") then
+		return true
+	end
+	if rawget(_G, "LevelSettings") and LevelSettings[current_level] and LevelSettings[current_level].hub_level then
+		return true
+	end
+	local game_mode = Managers.state and Managers.state.game_mode
+	if game_mode and game_mode.settings and game_mode:settings().key == "inn" then
+		return true
+	end
+	return false
+end
+
+-- Safe localization fallback to completely prevent <Invalid string format>
+mod.safe_localize = function(self, key, ...)
+	local ok, res = pcall(self.localize, self, key, ...)
+	if ok and res and not res:find("Invalid string format") then
+		return res
+	end
+
+	local a1 = tostring(select(1, ...) or "")
+	local a2 = tostring(select(2, ...) or "")
+	local fallbacks = {
+		cannot_restore_in_inn = "在大廳中無法執行戰局快照回溯！請先載入進入該地圖關卡中再執行回溯。",
+		cannot_save_in_inn = "在大廳中無法儲存戰局快照！戰局快照僅能在關卡進行中儲存。",
+		snapshot_level_mismatch = "快照地圖「" .. a1 .. "」與當前地圖「" .. a2 .. "」不符，無法恢復！",
+		snapshot_applied_seed = "快照恢復完成！（地圖 Seed: " .. a1 .. "）。遊戲已自動【暫停定格】以等待隊友連線，全員就緒後請輸入 /unpause 繼續。",
+		snapshot_detected_prompt = "偵測到本關卡「" .. a1 .. "」（Seed: " .. a2 .. "）的上次快照記錄！若需接續進度請輸入 /restore_snapshot。",
+		player_joined_paused = "玩家「" .. a1 .. "」已在暫停狀態下成功加入並接管角色進場。",
+		game_paused = "遊戲已完全定格！重新加入的玩家現在可以安全連線並進場接管角色。",
+		game_unpaused = "遊戲已恢復！繼續戰鬥。",
+		not_server = "只有房主（Host）可以執行此操作！",
+		snapshot_saved = "戰局快照已成功儲存！",
+		snapshot_save_failed = "戰局快照儲存失敗。",
+		snapshot_not_found = "未找到可讀取的快照檔案。",
+	}
+	return fallbacks[key] or ("<" .. tostring(key) .. ">")
+end
+
 -- Freeze / unfreeze a specific player unit for all clients via native game locomotion RPC
 local function _set_unit_locomotion_disabled(unit, disabled)
 	if not unit or not Unit.alive(unit) then
@@ -57,6 +106,38 @@ local function _set_unit_cooldown_paused(unit, paused)
 				career_ext:set_activated_ability_cooldown_unpaused()
 			end
 		end
+	end)
+end
+
+-- Sync statistic number to clients via native RPC
+mod.sync_stat_to_clients = function(peer_id, local_player_id, path_array, value)
+	pcall(function()
+		if not Managers.state.network or not Managers.state.network:in_game_session() then
+			return
+		end
+		if not NetworkLookup or not NetworkLookup.statistics_path_names then
+			return
+		end
+
+		local net_path = {}
+		for i = 1, #path_array do
+			local name = path_array[i]
+			local id = NetworkLookup.statistics_path_names[name]
+			if not id then
+				return -- Cannot networkify this path
+			end
+			net_path[i] = id
+		end
+
+		local val = math.clamp(math.floor(value or 0), 0, 65535)
+		Managers.state.network.network_transmit:send_rpc_clients(
+			"rpc_sync_statistics_number",
+			peer_id,
+			local_player_id,
+			net_path,
+			val,
+			val
+		)
 	end)
 end
 
@@ -108,22 +189,28 @@ mod.apply_pause_state = function(self, paused, preserve_positions)
 		end
 	else
 		-- 1. Unfreeze world animations and resume game clock
-		ScriptWorld.unpause(world)
-		if Managers.time:has_timer("game") then
-			Managers.time:set_local_scale("game", 1)
-		end
+		pcall(function()
+			ScriptWorld.unpause(world)
+		end)
+		pcall(function()
+			if Managers.time and Managers.time:has_timer("game") then
+				Managers.time:set_local_scale("game", 1)
+			end
+		end)
 
 		-- 2. Restore movement and unfreeze ability cooldowns for all players
-		if Managers.player then
-			local players = Managers.player:players()
-			for _, player in pairs(players) do
-				local unit = player.player_unit
-				if unit and Unit.alive(unit) then
-					_set_unit_locomotion_disabled(unit, false)
-					_set_unit_cooldown_paused(unit, false)
+		pcall(function()
+			if Managers.player then
+				local players = Managers.player:players()
+				for _, player in pairs(players) do
+					local unit = player.player_unit
+					if unit and Unit.alive(unit) then
+						_set_unit_locomotion_disabled(unit, false)
+						_set_unit_cooldown_paused(unit, false)
+					end
 				end
 			end
-		end
+		end)
 		mod._paused_player_positions = {}
 	end
 end
@@ -148,7 +235,7 @@ mod.do_pause = function()
 	end
 
 	if not Managers.player or not Managers.player.is_server then
-		mod:echo(mod:localize("not_server"))
+		mod:echo(mod:safe_localize("not_server"))
 		return
 	end
 
@@ -156,9 +243,9 @@ mod.do_pause = function()
 	mod:apply_pause_state(new_state)
 
 	if new_state then
-		mod:chat_broadcast(mod:localize("game_paused"))
+		mod:chat_broadcast(mod:safe_localize("game_paused"))
 	else
-		mod:chat_broadcast(mod:localize("game_unpaused"))
+		mod:chat_broadcast(mod:safe_localize("game_unpaused"))
 	end
 end
 
@@ -169,13 +256,13 @@ mod.do_unpause = function()
 	end
 
 	if not Managers.player or not Managers.player.is_server then
-		mod:echo(mod:localize("not_server"))
+		mod:echo(mod:safe_localize("not_server"))
 		return
 	end
 
 	if mod.is_paused then
 		mod:apply_pause_state(false)
-		mod:chat_broadcast(mod:localize("game_unpaused"))
+		mod:chat_broadcast(mod:safe_localize("game_unpaused"))
 	end
 end
 
@@ -185,13 +272,12 @@ mod.do_save_snapshot = function()
 		return
 	end
 	if not Managers.player or not Managers.player.is_server then
-		mod:echo(mod:localize("not_server"))
+		mod:echo(mod:safe_localize("not_server"))
 		return
 	end
 
-	local current_level = Managers.level_transition_handler and Managers.level_transition_handler:get_current_level_key()
-	if not current_level or current_level == "inn_level" then
-		mod:chat_broadcast(mod:localize("cannot_save_in_inn"))
+	if mod.is_in_inn() then
+		mod:chat_broadcast(mod:safe_localize("cannot_save_in_inn"))
 		return
 	end
 
@@ -204,22 +290,38 @@ mod.do_restore_snapshot = function()
 		return
 	end
 	if not Managers.player or not Managers.player.is_server then
-		mod:echo(mod:localize("not_server"))
+		mod:echo(mod:safe_localize("not_server"))
 		return
 	end
 
-	local current_level = Managers.level_transition_handler and Managers.level_transition_handler:get_current_level_key()
-	if not current_level or current_level == "inn_level" then
-		mod:chat_broadcast(mod:localize("cannot_restore_in_inn"))
+	if mod.is_in_inn() then
+		mod:chat_broadcast(mod:safe_localize("cannot_restore_in_inn"))
 		return
 	end
 
 	SnapshotManager:apply_snapshot()
 end
 
--- Hook ConflictDirector to halt AI director/pacing/spawns during pause
+-- Guard AILineOfSightExtension:has_line_of_sight against nil blackboard (can occur on freshly spawned units)
+if rawget(_G, "AILineOfSightExtension") then
+	mod:hook(AILineOfSightExtension, "has_line_of_sight", function(func, self, unit, blackboard, override_target, override_distance)
+		if not blackboard then
+			return false, 0
+		end
+		return func(self, unit, blackboard, override_target, override_distance)
+	end)
+end
+
+-- Hook ConflictDirector to halt AI director/pacing/spawns during pause.
+-- mod._allow_director_updates allows frames through after snapshot restore
+-- so that spawn_queued_unit enemies get flushed from the queue before re-pausing.
+mod._allow_director_updates = 0
 mod:hook(ConflictDirector, "update", function(func, self, dt, t)
 	if mod.is_paused then
+		if mod._allow_director_updates and mod._allow_director_updates > 0 then
+			mod._allow_director_updates = mod._allow_director_updates - 1
+			return func(self, dt, t)
+		end
 		return
 	end
 	return func(self, dt, t)
@@ -267,7 +369,7 @@ mod:hook_safe(NetworkServer, "peer_spawned_player", function(self, peer_id)
 		end
 
 		local player_name = player and player:name() or tostring(peer_id)
-		local joined_msg = mod:localize("player_joined_paused"):gsub("%%s", tostring(player_name), 1)
+		local joined_msg = mod:safe_localize("player_joined_paused", player_name)
 		mod:chat_broadcast(joined_msg)
 	end
 end)
