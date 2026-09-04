@@ -60,8 +60,11 @@ local function _set_unit_cooldown_paused(unit, paused)
 	end)
 end
 
+mod.set_unit_locomotion_disabled = _set_unit_locomotion_disabled
+mod.set_unit_cooldown_paused = _set_unit_cooldown_paused
+
 -- Apply unified pause state (Freezes animations at current frame, disables all attacks, locks movement, freezes CD & buffs)
-mod.apply_pause_state = function(self, paused)
+mod.apply_pause_state = function(self, paused, preserve_positions)
 	if not mod.is_in_game() then
 		mod.is_paused = false
 		return
@@ -82,18 +85,22 @@ mod.apply_pause_state = function(self, paused)
 		end
 
 		-- 2. Lock movement and freeze ability cooldowns for all players
-		mod._paused_player_positions = {}
+		if not preserve_positions then
+			mod._paused_player_positions = {}
+		end
 		if Managers.player then
 			local players = Managers.player:players()
 			for _, player in pairs(players) do
 				local unit = player.player_unit
 				if unit and Unit.alive(unit) then
-					local pos = Unit.world_position(unit, 0)
-					local rot = Unit.world_rotation(unit, 0)
-					mod._paused_player_positions[unit] = {
-						pos = Vector3(pos.x, pos.y, pos.z),
-						rot = Quaternion.from_elements(Quaternion.to_elements(rot)),
-					}
+					if not mod._paused_player_positions[unit] then
+						local pos = Unit.world_position(unit, 0)
+						local rot = Unit.world_rotation(unit, 0)
+						mod._paused_player_positions[unit] = {
+							pos = Vector3(pos.x, pos.y, pos.z),
+							rot = Quaternion.from_elements(Quaternion.to_elements(rot)),
+						}
+					end
 					_set_unit_locomotion_disabled(unit, true)
 					_set_unit_cooldown_paused(unit, true)
 				end
@@ -182,6 +189,12 @@ mod.do_save_snapshot = function()
 		return
 	end
 
+	local current_level = Managers.level_transition_handler and Managers.level_transition_handler:get_current_level_key()
+	if not current_level or current_level == "inn_level" then
+		mod:chat_broadcast(mod:localize("cannot_save_in_inn"))
+		return
+	end
+
 	SnapshotManager:save_snapshot(false)
 end
 
@@ -192,6 +205,12 @@ mod.do_restore_snapshot = function()
 	end
 	if not Managers.player or not Managers.player.is_server then
 		mod:echo(mod:localize("not_server"))
+		return
+	end
+
+	local current_level = Managers.level_transition_handler and Managers.level_transition_handler:get_current_level_key()
+	if not current_level or current_level == "inn_level" then
+		mod:chat_broadcast(mod:localize("cannot_restore_in_inn"))
 		return
 	end
 
@@ -248,7 +267,8 @@ mod:hook_safe(NetworkServer, "peer_spawned_player", function(self, peer_id)
 		end
 
 		local player_name = player and player:name() or tostring(peer_id)
-		mod:chat_broadcast(string.format(mod:localize("player_joined_paused"), player_name))
+		local joined_msg = mod:localize("player_joined_paused"):gsub("%%s", tostring(player_name), 1)
+		mod:chat_broadcast(joined_msg)
 	end
 end)
 
@@ -302,8 +322,15 @@ mod.on_unload = function(exit_game)
 	end
 end
 
--- Register slash commands
-mod:command("pause", mod:localize("pause_command_description"), function() mod.do_pause() end)
-mod:command("unpause", mod:localize("unpause_command_description"), function() mod.do_unpause() end)
-mod:command("save_snapshot", mod:localize("save_snapshot_command_description"), function() mod.do_save_snapshot() end)
-mod:command("restore_snapshot", mod:localize("restore_snapshot_command_description"), function() mod.do_restore_snapshot() end)
+-- Register slash commands safely (using pcall to avoid crashing if another mod registered the same command name)
+local function _safe_command(name, desc, callback)
+	pcall(function()
+		mod:command(name, desc, callback)
+	end)
+end
+
+_safe_command("pause", mod:localize("pause_command_description"), function() mod.do_pause() end)
+_safe_command("pause_game", mod:localize("pause_command_description"), function() mod.do_pause() end)
+_safe_command("unpause", mod:localize("unpause_command_description"), function() mod.do_unpause() end)
+_safe_command("save_snapshot", mod:localize("save_snapshot_command_description"), function() mod.do_save_snapshot() end)
+_safe_command("restore_snapshot", mod:localize("restore_snapshot_command_description"), function() mod.do_restore_snapshot() end)

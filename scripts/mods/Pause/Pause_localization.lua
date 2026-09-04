@@ -114,4 +114,14 @@ return {
 		["zh-tw"] = "偵測到本關卡「%s」（Seed: %s）的上次快照記錄！若需接續進度請輸入 /restore_snapshot。",
 		zh = "侦测到本关卡「%s」（Seed: %s）的上次快照记录！若需接续进度请输入 /restore_snapshot。",
 	},
+	cannot_restore_in_inn = {
+		en = "Cannot restore snapshot while inside the Inn/Lobby! Please load into the mission first.",
+		["zh-tw"] = "在大廳中無法執行戰局快照回溯！請先載入進入該地圖關卡中再執行回溯。",
+		zh = "在大厅中无法执行战局快照回溯！请先载入进入该地图关卡中再执行回溯。",
+	},
+	cannot_save_in_inn = {
+		en = "Cannot save snapshot while inside the Inn/Lobby! Snapshots can only be saved during a mission.",
+		["zh-tw"] = "在大廳中無法儲存戰局快照！戰局快照僅能在關卡進行中儲存。",
+		zh = "在大厅中无法储存战局快照！战局快照仅能在关卡进行中储存。",
+	},
 }

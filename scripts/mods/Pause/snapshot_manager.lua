@@ -10,27 +10,13 @@ SnapshotManager.__index = SnapshotManager
 
 local AUTO_SNAPSHOT_INTERVAL = 60 -- Default interval in seconds
 
-local function _get_storage_dir()
-	local appdata = os.getenv("APPDATA") or os.getenv("LOCALAPPDATA") or "."
-	local dir = appdata:gsub("\\", "/") .. "/Vermintide2/Mods/Pause"
-	pcall(function()
-		os.execute('mkdir "' .. dir:gsub("/", "\\") .. '" 2>nul')
-	end)
-	return dir
-end
 
-local function _get_snapshot_path()
-	return _get_storage_dir() .. "/pause_snapshot_latest.json"
-end
-
-local function _get_backup_path()
-	return _get_storage_dir() .. "/pause_snapshot_backup.bak"
-end
 
 function SnapshotManager:init()
 	self._auto_timer = 0
 	self._level_prompted = false
 	self._last_loaded_level = nil
+	self._pause_after_restore_countdown = nil
 end
 
 --- Collect complete level, flow, player, enemy, and scoreboard state
@@ -42,7 +28,10 @@ function SnapshotManager:collect_snapshot()
 		return nil, "Only host can capture snapshot"
 	end
 
-	local level_key = Managers.level_transition_handler:get_current_level_key()
+	local level_key = Managers.level_transition_handler and Managers.level_transition_handler:get_current_level_key()
+	if not level_key or level_key == "inn_level" then
+		return nil, "Cannot save snapshot in Inn/Lobby"
+	end
 	local level_seed = Managers.level_transition_handler:get_current_level_seed()
 	local difficulty, difficulty_tweak = Managers.state.difficulty:get_difficulty()
 	local mechanism = Managers.mechanism and Managers.mechanism:current_mechanism_name() or "adventure"
@@ -174,7 +163,7 @@ function SnapshotManager:collect_snapshot()
 		end
 	end)
 
-	-- 7. Scoreboard Statistics
+	-- 7. Scoreboard Statistics (Save exact raw stats to support full rollback)
 	pcall(function()
 		local statistics_db = Managers.player and Managers.player:statistics_db()
 		local players = Managers.player and Managers.player:players()
@@ -183,27 +172,157 @@ function SnapshotManager:collect_snapshot()
 			for _, player in pairs(players) do
 				local stats_id = player:stats_id()
 				local player_scores = {}
+				local raw_stats = {}
+
 				for _, topic in ipairs(scoreboard_topics) do
 					local stat_types = topic.stat_types
 					local score = 0
 					if stat_types ~= nil then
 						for j = 1, #stat_types do
-							score = score + (statistics_db:get_stat(stats_id, stat_types[j]) or 0)
+							local st = stat_types[j]
+							local v = 0
+							if type(st) == "table" then
+								v = statistics_db:get_stat(stats_id, unpack(st)) or 0
+								local path_key = table.concat(st, "##")
+								raw_stats[path_key] = v
+							else
+								v = statistics_db:get_stat(stats_id, st) or 0
+								raw_stats[tostring(st)] = v
+							end
+							score = score + v
 						end
 					elseif topic.stat_type then
-						score = statistics_db:get_stat(stats_id, topic.stat_type) or 0
+						local st = topic.stat_type
+						local v = 0
+						if type(st) == "table" then
+							v = statistics_db:get_stat(stats_id, unpack(st)) or 0
+							local path_key = table.concat(st, "##")
+							raw_stats[path_key] = v
+						else
+							v = statistics_db:get_stat(stats_id, st) or 0
+							raw_stats[tostring(st)] = v
+						end
+						score = v
 					end
 					player_scores[topic.name] = score
 				end
-				snapshot.scoreboard[player:name() or stats_id] = {
+
+				-- Explicitly capture direct total damage dealt & taken
+				local direct_dmg = statistics_db:get_stat(stats_id, "damage_dealt") or 0
+				raw_stats["damage_dealt"] = direct_dmg
+				player_scores["damage_dealt"] = direct_dmg
+
+				local direct_taken = statistics_db:get_stat(stats_id, "damage_taken") or 0
+				raw_stats["damage_taken"] = direct_taken
+				player_scores["damage_taken"] = direct_taken
+
+				local entry = {
 					stats_id = stats_id,
+					profile_index = player:profile_index(),
+					career_index = player:career_index(),
+					name = player:name(),
 					scores = player_scores,
+					raw_stats = raw_stats,
 				}
+
+				if player:name() then
+					snapshot.scoreboard[player:name()] = entry
+				end
+				snapshot.scoreboard[stats_id] = entry
+				if player:profile_index() then
+					snapshot.scoreboard[tostring(player:profile_index())] = entry
+				end
 			end
 		end
 	end)
 
 	return snapshot
+end
+
+-- Deep sanitizer to ensure all tables, keys, and values are JSON-serializable
+local function _sanitize_for_json(val, visited)
+	visited = visited or {}
+	local val_type = type(val)
+
+	if val_type == "number" or val_type == "string" or val_type == "boolean" then
+		return val
+	elseif val_type == "nil" then
+		return nil
+	elseif val_type == "userdata" then
+		-- Check if it is a Vector3
+		if Vector3 and pcall(Vector3.to_elements, val) then
+			local x, y, z = Vector3.to_elements(val)
+			return { x, y, z }
+		end
+		-- Check if it is a Quaternion
+		if Quaternion and pcall(Quaternion.to_elements, val) then
+			local x, y, z, w = Quaternion.to_elements(val)
+			return { x, y, z, w }
+		end
+		-- Check if it is a Vector3Box
+		if Vector3Box and pcall(Vector3Box.unbox, val) then
+			local vec = val:unbox()
+			if vec then
+				return { vec.x, vec.y, vec.z }
+			end
+		end
+		-- Check if it is a QuaternionBox
+		if QuaternionBox and pcall(QuaternionBox.unbox, val) then
+			local q = val:unbox()
+			if q then
+				local x, y, z, w = Quaternion.to_elements(q)
+				return { x, y, z, w }
+			end
+		end
+		-- Other userdata: ignore/nil to avoid JSON crash
+		return nil
+	elseif val_type == "table" then
+		if visited[val] then
+			return nil -- Avoid circular references
+		end
+		visited[val] = true
+
+		-- Check if table is a dense sequential array (1..N with no holes)
+		local count = 0
+		local max_int_key = 0
+		local has_non_int = false
+
+		for k, _ in pairs(val) do
+			count = count + 1
+			if type(k) == "number" and math.floor(k) == k and k >= 1 then
+				if k > max_int_key then
+					max_int_key = k
+				end
+			else
+				has_non_int = true
+			end
+		end
+
+		local is_dense_array = (not has_non_int) and (count > 0) and (max_int_key == count)
+
+		local clean_table = {}
+		if is_dense_array then
+			-- Safe sequential array -> encode as JSON array [ ... ]
+			for i = 1, count do
+				clean_table[i] = _sanitize_for_json(val[i], visited)
+			end
+		else
+			-- Object/Map: Force ALL keys to string to prevent cjson "excessively sparse array" error!
+			for k, v in pairs(val) do
+				local clean_v = _sanitize_for_json(v, visited)
+				if clean_v ~= nil then
+					local clean_k = tostring(k)
+					clean_table[clean_k] = clean_v
+				end
+			end
+		end
+
+		visited[val] = nil
+		return clean_table
+	else
+		-- Functions, threads, etc. are omitted
+		return nil
+	end
 end
 
 --- Save snapshot to file with atomic backup
@@ -216,64 +335,56 @@ function SnapshotManager:save_snapshot(is_auto)
 		return false
 	end
 
-	local success, json_str = pcall(cjson.encode, snapshot)
-	if not success or not json_str then
+	-- Deeply sanitize table to remove any non-serializable userdata or invalid keys
+	local clean_snapshot = _sanitize_for_json(snapshot)
+
+	local success, json_str_or_err = pcall(cjson.encode, clean_snapshot)
+	if not success or not json_str_or_err then
+		local err_msg = tostring(json_str_or_err or "Unknown")
+		mod:echo("[Pause] JSON Encode Error: " .. err_msg)
 		if not is_auto then
-			mod:chat_broadcast(mod:localize("snapshot_save_failed") .. " (JSON Encode Error)")
+			mod:chat_broadcast(mod:localize("snapshot_save_failed") .. " (" .. err_msg .. ")")
 		end
 		return false
 	end
 
-	local path = _get_snapshot_path()
-	local backup_path = _get_backup_path()
+	local json_str = json_str_or_err
 
-	-- Backup previous snapshot if it exists
-	local prev_file = io.open(path, "r")
-	if prev_file then
-		local prev_content = prev_file:read("*a")
-		prev_file:close()
-		local bak_file = io.open(backup_path, "w")
-		if bak_file then
-			bak_file:write(prev_content)
-			bak_file:close()
-		end
+	-- Backup previous snapshot and save new snapshot via VMF persistent storage
+	local prev_snapshot = mod:get("latest_snapshot")
+	if prev_snapshot then
+		mod:set("backup_snapshot", prev_snapshot)
 	end
+	mod:set("latest_snapshot", json_str)
 
-	local file = io.open(path, "w")
-	if file then
-		file:write(json_str)
-		file:close()
-		if not is_auto then
-			mod:chat_broadcast(mod:localize("snapshot_saved"))
-		end
-		return true
-	else
-		if not is_auto then
-			mod:chat_broadcast(mod:localize("snapshot_save_failed") .. " (File Write Error)")
-		end
-		return false
+	if not is_auto then
+		mod:chat_broadcast(mod:localize("snapshot_saved"))
 	end
+	return true
 end
 
---- Load snapshot from disk
+--- Load snapshot from VMF persistent storage
 function SnapshotManager:load_snapshot()
-	local path = _get_snapshot_path()
-	local file = io.open(path, "r")
-	if not file then
-		-- Try backup
-		path = _get_backup_path()
-		file = io.open(path, "r")
+	local json_data = mod:get("latest_snapshot")
+	if not json_data then
+		json_data = mod:get("backup_snapshot")
 	end
 
-	if not file then
+	if not json_data then
 		return nil, "No snapshot file found"
 	end
 
-	local json_str = file:read("*a")
-	file:close()
+	local snapshot = nil
+	if type(json_data) == "string" then
+		local success, decoded = pcall(cjson.decode, json_data)
+		if success and decoded then
+			snapshot = decoded
+		end
+	elseif type(json_data) == "table" then
+		snapshot = json_data
+	end
 
-	local success, snapshot = pcall(cjson.decode, json_str)
-	if not success or not snapshot then
+	if not snapshot then
 		return nil, "Corrupted snapshot file"
 	end
 
@@ -297,10 +408,8 @@ end
 
 --- Clean up snapshots (keep only last match)
 function SnapshotManager:cleanup_snapshot()
-	pcall(function()
-		os.remove(_get_snapshot_path())
-		os.remove(_get_backup_path())
-	end)
+	mod:set("latest_snapshot", nil)
+	mod:set("backup_snapshot", nil)
 end
 
 --- Apply a loaded snapshot to the current match
@@ -316,10 +425,23 @@ function SnapshotManager:apply_snapshot(snapshot)
 		return false
 	end
 
-	local current_level = Managers.level_transition_handler:get_current_level_key()
-	if snapshot.level_key ~= current_level then
-		mod:chat_broadcast(string.format(mod:localize("snapshot_level_mismatch"), tostring(snapshot.level_key), tostring(current_level)))
+	local current_level = Managers.level_transition_handler and Managers.level_transition_handler:get_current_level_key()
+	if not current_level or current_level == "inn_level" then
+		mod:chat_broadcast(mod:localize("cannot_restore_in_inn"))
 		return false
+	end
+
+	if snapshot.level_key ~= current_level then
+		local mismatch_msg = mod:localize("snapshot_level_mismatch")
+		mismatch_msg = mismatch_msg:gsub("%%s", tostring(snapshot.level_key or ""), 1)
+		mismatch_msg = mismatch_msg:gsub("%%s", tostring(current_level or ""), 1)
+		mod:chat_broadcast(mismatch_msg)
+		return false
+	end
+
+	-- If previously paused, temporarily unpause so physics, camera and units can process restore and render
+	if mod.is_paused then
+		mod:apply_pause_state(false)
 	end
 
 	-- 1. Restore Level Seed & Analysis
@@ -372,6 +494,23 @@ function SnapshotManager:apply_snapshot(snapshot)
 					locomotion_ext:teleport_to(pos, rot)
 				end
 
+				-- Force first person camera to immediately update position
+				local fp_ext = ScriptUnit.has_extension(pl_unit, "first_person_system") and ScriptUnit.extension(pl_unit, "first_person_system")
+				if fp_ext and fp_ext.update_position then
+					fp_ext:update_position()
+				end
+
+				-- Lock movement right away so player doesn't wander off during frame refresh
+				if mod.set_unit_locomotion_disabled then
+					mod.set_unit_locomotion_disabled(pl_unit, true)
+				end
+
+				-- Immediately update mod._paused_player_positions to the restored snapshot coordinate
+				mod._paused_player_positions[pl_unit] = {
+					pos = Vector3(pos.x, pos.y, pos.z),
+					rot = Quaternion.from_elements(Quaternion.to_elements(rot)),
+				}
+
 				local health_ext = ScriptUnit.has_extension(pl_unit, "health_system") and ScriptUnit.extension(pl_unit, "health_system")
 				if health_ext then
 					health_ext:set_server_damage_taken(pl_data.damage_taken or 0)
@@ -416,26 +555,54 @@ function SnapshotManager:apply_snapshot(snapshot)
 		end
 	end)
 
-	-- 7. Restore Scoreboard Statistics
+	-- 7. Restore Scoreboard Statistics (Full Rollback to exact snapshot stats)
 	pcall(function()
 		local statistics_db = Managers.player and Managers.player:statistics_db()
 		local current_players = Managers.player and Managers.player:players()
 		if statistics_db and current_players and snapshot.scoreboard then
 			for _, player in pairs(current_players) do
 				local stats_id = player:stats_id()
-				local saved_entry = snapshot.scoreboard[player:name()] or snapshot.scoreboard[stats_id]
-				if saved_entry and saved_entry.scores then
-					for topic_name, score in pairs(saved_entry.scores) do
-						for _, topic in ipairs(ScoreboardHelper.scoreboard_topic_stats) do
-							if topic.name == topic_name then
-								if topic.stat_types then
-									local primary_stat = topic.stat_types[1]
-									statistics_db:set_stat(stats_id, primary_stat, score)
-								elseif topic.stat_type then
-									statistics_db:set_stat(stats_id, topic.stat_type, score)
+				local p_name = player:name()
+				local p_idx = tostring(player:profile_index())
+
+				local saved_entry = (p_name and snapshot.scoreboard[p_name])
+					or snapshot.scoreboard[stats_id]
+					or snapshot.scoreboard[p_idx]
+
+				if saved_entry then
+					if saved_entry.raw_stats then
+						for stat_key, val in pairs(saved_entry.raw_stats) do
+							pcall(function()
+								local sep = stat_key:find("##")
+								if sep then
+									local p1 = stat_key:sub(1, sep - 1)
+									local p2 = stat_key:sub(sep + 2)
+									local sep2 = p2:find("##")
+									if sep2 then
+										local p2_real = p2:sub(1, sep2 - 1)
+										local p3_real = p2:sub(sep2 + 2)
+										statistics_db:set_stat(stats_id, p1, p2_real, p3_real, tonumber(val) or 0)
+									else
+										statistics_db:set_stat(stats_id, p1, p2, tonumber(val) or 0)
+									end
+								else
+									statistics_db:set_stat(stats_id, stat_key, tonumber(val) or 0)
 								end
-								break
-							end
+							end)
+						end
+					end
+
+					-- Explicitly ensure direct damage dealt and taken are reset
+					if saved_entry.scores then
+						if saved_entry.scores.damage_dealt ~= nil then
+							pcall(function()
+								statistics_db:set_stat(stats_id, "damage_dealt", tonumber(saved_entry.scores.damage_dealt) or 0)
+							end)
+						end
+						if saved_entry.scores.damage_taken ~= nil then
+							pcall(function()
+								statistics_db:set_stat(stats_id, "damage_taken", tonumber(saved_entry.scores.damage_taken) or 0)
+							end)
 						end
 					end
 				end
@@ -443,15 +610,29 @@ function SnapshotManager:apply_snapshot(snapshot)
 		end
 	end)
 
-	-- 8. Auto-pause game after restore so players can connect safely
-	mod:apply_pause_state(true, true)
+	-- 8. Auto-pause game after 3 frames so the engine renders the restored state
+	self._pause_after_restore_countdown = 3
 
-	mod:chat_broadcast(string.format(mod:localize("snapshot_applied_seed"), tostring(snapshot.level_seed or "default")))
+	local seed_str = tostring(snapshot.level_seed or "default")
+	local applied_msg = mod:localize("snapshot_applied_seed")
+	if applied_msg:find("%%s") then
+		applied_msg = applied_msg:gsub("%%s", seed_str, 1)
+	end
+	mod:chat_broadcast(applied_msg)
 	return true
 end
 
 --- Update loop for periodic auto-snapshot and level-start detection prompt
 function SnapshotManager:update(dt)
+	-- Handle delayed pause countdown after snapshot restore (allows 3 frames to render restored scene)
+	if self._pause_after_restore_countdown then
+		self._pause_after_restore_countdown = self._pause_after_restore_countdown - 1
+		if self._pause_after_restore_countdown <= 0 then
+			self._pause_after_restore_countdown = nil
+			mod:apply_pause_state(true, true)
+		end
+	end
+
 	if not mod.is_in_game() or not Managers.player or not Managers.player.is_server then
 		return
 	end
@@ -464,7 +645,10 @@ function SnapshotManager:update(dt)
 			self._level_prompted = true
 			local has_snapshot, snapshot = self:has_snapshot_for_current_level()
 			if has_snapshot and snapshot then
-				mod:chat_broadcast(string.format(mod:localize("snapshot_detected_prompt"), tostring(snapshot.level_key), tostring(snapshot.level_seed or "")))
+				local prompt_msg = mod:localize("snapshot_detected_prompt")
+				prompt_msg = prompt_msg:gsub("%%s", tostring(snapshot.level_key or ""), 1)
+				prompt_msg = prompt_msg:gsub("%%s", tostring(snapshot.level_seed or ""), 1)
+				mod:chat_broadcast(prompt_msg)
 			end
 		end
 
