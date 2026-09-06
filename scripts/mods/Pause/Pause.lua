@@ -78,7 +78,11 @@ local function _set_unit_locomotion_disabled(unit, disabled)
 	pcall(function()
 		local locomotion_ext = ScriptUnit.has_extension(unit, "locomotion_system") and ScriptUnit.extension(unit, "locomotion_system")
 		if locomotion_ext then
-			locomotion_ext:set_disabled(disabled, nil)
+			-- PlayerHuskLocomotionExtension.update calls self._run_func() while disabled.
+			-- Passing nil crashes it, so supply a no-op; nil is fine when re-enabling
+			-- (set_disabled false resets lerp data internally, no func needed).
+			local safe_run_func = disabled and function() end or nil
+			locomotion_ext:set_disabled(disabled, safe_run_func)
 		end
 
 		if Managers.player and Managers.player.is_server and Managers.state.network and Managers.state.unit_storage then
@@ -130,13 +134,31 @@ mod.sync_stat_to_clients = function(peer_id, local_player_id, path_array, value)
 		end
 
 		local val = math.clamp(math.floor(value or 0), 0, 65535)
+		local persistent_val = 0
+
+		-- Fatshark's rpc_sync_statistics_number asserts that persistent_value MUST be 0
+		-- if the stat does not have a database_name.
+		local statistics_db = Managers.player and Managers.player:statistics_db()
+		local player = Managers.player and Managers.player:player(peer_id, local_player_id)
+		if statistics_db and player and statistics_db.statistics then
+			local stats_id = player:stats_id()
+			local node = statistics_db.statistics[stats_id]
+			for i = 1, #path_array do
+				if not node then break end
+				node = node[path_array[i]]
+			end
+			if node and node.database_name then
+				persistent_val = val
+			end
+		end
+
 		Managers.state.network.network_transmit:send_rpc_clients(
 			"rpc_sync_statistics_number",
 			peer_id,
 			local_player_id,
 			net_path,
 			val,
-			val
+			persistent_val
 		)
 	end)
 end
@@ -312,6 +334,50 @@ if rawget(_G, "AILineOfSightExtension") then
 	end)
 end
 
+-- Guard PlayerHuskLocomotionExtension to prevent multiplayer crashes during snapshot restore and pause
+if rawget(_G, "PlayerHuskLocomotionExtension") then
+	mod:hook(PlayerHuskLocomotionExtension, "teleport_to", function(func, self, pos, optional_rot)
+		func(self, pos, optional_rot)
+		pcall(function()
+			local unit = self.unit
+			if unit and Unit.alive(unit) then
+				Unit.set_data(unit, "last_lerp_position", pos)
+				Unit.set_data(unit, "last_lerp_position_offset", Vector3(0, 0, 0))
+				Unit.set_data(unit, "accumulated_movement", Vector3(0, 0, 0))
+				self._pos_lerp_time = 0
+			end
+		end)
+	end)
+
+	mod:hook(PlayerHuskLocomotionExtension, "_extrapolation_movement", function(func, self, unit, dt, old_pos, new_pos, new_rot, movement_state, velocity, linked_movement, moving_platform)
+		-- Ensure last_lerp_position, last_lerp_position_offset, and accumulated_movement are valid Vector3s
+		local last_pos = Unit.get_data(unit, "last_lerp_position")
+		if not last_pos or type(last_pos) ~= "userdata" or not pcall(function() return last_pos.x end) then
+			Unit.set_data(unit, "last_lerp_position", old_pos)
+		end
+		local last_pos_offset = Unit.get_data(unit, "last_lerp_position_offset")
+		if not last_pos_offset or type(last_pos_offset) ~= "userdata" or not pcall(function() return last_pos_offset.x end) then
+			Unit.set_data(unit, "last_lerp_position_offset", Vector3(0, 0, 0))
+		end
+		local accumulated_movement = Unit.get_data(unit, "accumulated_movement")
+		if not accumulated_movement or type(accumulated_movement) ~= "userdata" or not pcall(function() return accumulated_movement.x end) then
+			Unit.set_data(unit, "accumulated_movement", Vector3(0, 0, 0))
+		end
+		return func(self, unit, dt, old_pos, new_pos, new_rot, movement_state, velocity, linked_movement, moving_platform)
+	end)
+end
+
+-- Guard TagQueryDatabase to prevent "invalid key to 'next'" crash when queries reference units destroyed during snapshot restore
+if rawget(_G, "TagQueryDatabase") then
+	mod:hook(TagQueryDatabase, "iterate_query", function(func, self, t)
+		local ok, res = pcall(func, self, t)
+		if not ok or not res then
+			return { result = nil }
+		end
+		return res
+	end)
+end
+
 -- Hook ConflictDirector to halt AI director/pacing/spawns during pause.
 -- mod._allow_director_updates allows frames through after snapshot restore
 -- so that spawn_queued_unit enemies get flushed from the queue before re-pausing.
@@ -383,9 +449,12 @@ mod.update = function(dt)
 		if mod.is_paused and Managers.player and Managers.player.is_server then
 			for unit, data in pairs(mod._paused_player_positions) do
 				if unit and Unit.alive(unit) and data.pos and data.rot then
-					local locomotion = ScriptUnit.has_extension(unit, "locomotion_system") and ScriptUnit.extension(unit, "locomotion_system")
-					if locomotion then
-						locomotion:teleport_to(data.pos, data.rot)
+					local current_pos = POSITION_LOOKUP[unit] or Unit.local_position(unit, 0)
+					if Vector3.distance_squared(current_pos, data.pos) > 0.04 then
+						local locomotion = ScriptUnit.has_extension(unit, "locomotion_system") and ScriptUnit.extension(unit, "locomotion_system")
+						if locomotion then
+							locomotion:teleport_to(data.pos, data.rot)
+						end
 					end
 				end
 			end

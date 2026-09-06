@@ -122,6 +122,7 @@ function SnapshotManager:collect_snapshot()
 					rotation = { qx, qy, qz, qw },
 					damage_taken = health_ext and health_ext:get_damage_taken() or 0,
 					max_health = health_ext and health_ext:get_max_health() or 100,
+					health_percentage = health_ext and health_ext:current_permanent_health_percent() or 1,
 					temporary_health_percentage = health_ext and health_ext:current_temporary_health_percent() or 0,
 					is_knocked_down = status_ext and status_ext:is_knocked_down() or false,
 					is_dead = status_ext and status_ext:is_dead() or false,
@@ -445,6 +446,19 @@ function SnapshotManager:apply_snapshot(snapshot)
 		mod:apply_pause_state(false)
 	end
 
+	-- Clear dialogue system queries and playing dialogues to avoid invalid key to 'next' crash during restore
+	pcall(function()
+		local dlg_sys = Managers.state.entity:system("dialogue_system")
+		if dlg_sys then
+			if dlg_sys._tagquery_database and dlg_sys._tagquery_database.queries then
+				table.clear(dlg_sys._tagquery_database.queries)
+			end
+			if dlg_sys._playing_dialogues then
+				table.clear(dlg_sys._playing_dialogues)
+			end
+		end
+	end)
+
 	-- 1. Restore Level Seed & Analysis
 	pcall(function()
 		if snapshot.level_seed and Managers.state.conflict and Managers.state.conflict.level_analysis then
@@ -473,9 +487,11 @@ function SnapshotManager:apply_snapshot(snapshot)
 		end
 	end)
 
-	-- 5. Restore Players (Teleport, Health, THP, Ammo, Cooldown)
-	pcall(function()
+	-- 5. Restore Players (Teleport, Status, HP, THP, Ammo, Consumables, Cooldown)
+	local pl_ok, pl_err = pcall(function()
 		local current_players = Managers.player:players()
+		local network_transmit = Managers.state.network and Managers.state.network.network_transmit
+
 		for _, pl_data in ipairs(snapshot.players or {}) do
 			local matched_player = nil
 			-- Match by profile / hero
@@ -486,58 +502,308 @@ function SnapshotManager:apply_snapshot(snapshot)
 				end
 			end
 
-			if matched_player and matched_player.player_unit and Unit.alive(matched_player.player_unit) then
-				local pl_unit = matched_player.player_unit
+			if matched_player then
 				local pos = Vector3(pl_data.position[1], pl_data.position[2], pl_data.position[3])
 				local rot = Quaternion.from_elements(pl_data.rotation[1], pl_data.rotation[2], pl_data.rotation[3], pl_data.rotation[4])
-				local locomotion_ext = ScriptUnit.has_extension(pl_unit, "locomotion_system") and ScriptUnit.extension(pl_unit, "locomotion_system")
-				if locomotion_ext then
-					locomotion_ext:teleport_to(pos, rot)
+				local was_knocked_down = pl_data.is_knocked_down == true
+				local was_dead = pl_data.is_dead == true
+
+				-- If player was dead in current game session but alive in snapshot, respawn them
+				if (not matched_player.player_unit or not Unit.alive(matched_player.player_unit)) and not was_dead then
+					pcall(function()
+						matched_player:spawn(pos, rot, false)
+					end)
 				end
 
-				-- Force first person camera to immediately update position
-				local fp_ext = ScriptUnit.has_extension(pl_unit, "first_person_system") and ScriptUnit.extension(pl_unit, "first_person_system")
-				if fp_ext and fp_ext.update_position then
-					fp_ext:update_position()
-				end
+				local pl_unit = matched_player.player_unit
+				if pl_unit and Unit.alive(pl_unit) then
+					local is_remote = matched_player.remote
+					local pl_go_id = Managers.state.unit_storage and Managers.state.unit_storage:go_id(pl_unit)
+					local locomotion_ext = ScriptUnit.has_extension(pl_unit, "locomotion_system") and ScriptUnit.extension(pl_unit, "locomotion_system")
 
-				-- Lock movement right away so player doesn't wander off during frame refresh
-				if mod.set_unit_locomotion_disabled then
-					mod.set_unit_locomotion_disabled(pl_unit, true)
-				end
-
-				-- Immediately update mod._paused_player_positions to the restored snapshot coordinate
-				mod._paused_player_positions[pl_unit] = {
-					pos = Vector3(pos.x, pos.y, pos.z),
-					rot = Quaternion.from_elements(Quaternion.to_elements(rot)),
-				}
-
-				local health_ext = ScriptUnit.has_extension(pl_unit, "health_system") and ScriptUnit.extension(pl_unit, "health_system")
-				if health_ext then
-					health_ext:set_server_damage_taken(pl_data.damage_taken or 0)
-					if pl_data.temporary_health_percentage and pl_data.temporary_health_percentage > 0 then
-						local max_hp = health_ext:get_max_health()
-						local thp_amount = max_hp * pl_data.temporary_health_percentage
-						health_ext:add_heal(pl_unit, thp_amount, "snapshot_restore", "buff")
+					-- 1. Teleport player & camera, and broadcast RPC to remote clients
+					if locomotion_ext then
+						locomotion_ext:teleport_to(pos, rot)
 					end
-				end
+					if is_remote and pl_go_id and network_transmit then
+						network_transmit:send_rpc_clients("rpc_teleport_unit_to", pl_go_id, pos, rot)
+					end
 
-				local career_ext = ScriptUnit.has_extension(pl_unit, "career_system") and ScriptUnit.extension(pl_unit, "career_system")
-				if career_ext and pl_data.ability_cooldown_percentage then
-					-- Restore ability cooldown
-					local max_cd = career_ext:get_max_ability_cooldown()
-					career_ext._ability_cooldown = max_cd * (1 - pl_data.ability_cooldown_percentage)
+					local fp_ext = ScriptUnit.has_extension(pl_unit, "first_person_system") and ScriptUnit.extension(pl_unit, "first_person_system")
+					if fp_ext and fp_ext.update_position then
+						fp_ext:update_position()
+					end
+
+					-- Lock movement right away so player doesn't wander off during frame refresh
+					if mod.set_unit_locomotion_disabled then
+						mod.set_unit_locomotion_disabled(pl_unit, true)
+					end
+
+					-- Immediately update mod._paused_player_positions to the restored snapshot coordinate
+					mod._paused_player_positions[pl_unit] = {
+						pos = Vector3(pos.x, pos.y, pos.z),
+						rot = Quaternion.from_elements(Quaternion.to_elements(rot)),
+					}
+
+					-- 2. Restore Status (Normal / Downed / Dead) and Health (HP / THP)
+					local status_ext = ScriptUnit.has_extension(pl_unit, "status_system") and ScriptUnit.extension(pl_unit, "status_system")
+					local health_ext = ScriptUnit.has_extension(pl_unit, "health_system") and ScriptUnit.extension(pl_unit, "health_system")
+
+					local max_hp = pl_data.max_health or (health_ext and health_ext:get_max_health()) or 100
+					local perm_hp_percent = pl_data.health_percentage
+					if not perm_hp_percent then
+						local dmg = pl_data.damage_taken or 0
+						perm_hp_percent = math.clamp((max_hp - dmg) / max_hp, 0, 1)
+					end
+					local temp_hp_percent = pl_data.temporary_health_percentage or 0
+
+					if status_ext and health_ext then
+						if was_dead then
+							-- CASE 1: DEAD
+							pcall(function()
+								if health_ext.die then
+									health_ext:die("forced")
+								else
+									local death_system = Managers.state.entity:system("death_system")
+									if death_system then
+										death_system:forced_kill(pl_unit, "forced")
+									end
+								end
+							end)
+							status_ext:set_dead(true)
+							health_ext.state = "dead"
+							health_ext.previous_state = "dead"
+							health_ext.set_health_percentage = 0
+							health_ext.set_temporary_health_percentage = 0
+							if health_ext.health_game_object_id and health_ext.game then
+								GameSession.set_game_object_field(health_ext.game, health_ext.health_game_object_id, "current_health", 0)
+								GameSession.set_game_object_field(health_ext.game, health_ext.health_game_object_id, "current_temporary_health", 0)
+							end
+							health_ext:set_server_damage_taken(max_hp)
+
+						elseif was_knocked_down then
+							-- CASE 2: KNOCKED DOWN
+							status_ext.dead = false
+							if not status_ext:is_knocked_down() then
+								StatusUtils.set_knocked_down_network(pl_unit, true)
+							end
+							health_ext.state = "knocked_down"
+							health_ext.previous_state = "knocked_down"
+							health_ext.set_health_percentage = 0
+							health_ext.set_temporary_health_percentage = temp_hp_percent
+							if health_ext.health_game_object_id and health_ext.game then
+								local curr_max = health_ext:get_max_health()
+								local thp_val = DamageUtils.networkify_health(curr_max * temp_hp_percent)
+								GameSession.set_game_object_field(health_ext.game, health_ext.health_game_object_id, "current_health", 0)
+								GameSession.set_game_object_field(health_ext.game, health_ext.health_game_object_id, "current_temporary_health", thp_val)
+							end
+							health_ext:set_server_damage_taken(max_hp)
+
+						else
+							-- CASE 3: NORMAL (ALIVE)
+							if status_ext:is_knocked_down() then
+								StatusUtils.set_knocked_down_network(pl_unit, false)
+							end
+							if status_ext:is_dead() then
+								status_ext.dead = false
+								if pl_go_id and network_transmit and NetworkLookup.statuses.dead then
+									network_transmit:send_rpc_clients("rpc_status_change_bool", NetworkLookup.statuses.dead, false, pl_go_id, 0)
+								end
+							end
+							StatusUtils.set_revived_network(pl_unit, true)
+
+							-- Set both state and previous_state to "alive" so engine update() doesn't detect a transition and overwrite health with revive defaults!
+							health_ext.state = "alive"
+							health_ext.previous_state = "alive"
+
+							health_ext.set_health_percentage = perm_hp_percent
+							health_ext.set_temporary_health_percentage = temp_hp_percent
+							if health_ext.health_game_object_id and health_ext.game then
+								local curr_max = health_ext:get_max_health()
+								local perm_val = DamageUtils.networkify_health(curr_max * perm_hp_percent)
+								local temp_val = DamageUtils.networkify_health(curr_max * temp_hp_percent)
+								GameSession.set_game_object_field(health_ext.game, health_ext.health_game_object_id, "current_health", perm_val)
+								GameSession.set_game_object_field(health_ext.game, health_ext.health_game_object_id, "current_temporary_health", temp_val)
+							end
+							local curr_max = health_ext:get_max_health()
+							health_ext:set_server_damage_taken(math.max(curr_max * (1 - perm_hp_percent), 0))
+						end
+					end
+
+					-- Sync party game_mode_data
+					pcall(function()
+						local party_manager = Managers.party
+						if party_manager then
+							local p_status = party_manager:get_player_status(matched_player:network_id(), matched_player:local_player_id())
+							if p_status and p_status.game_mode_data then
+								p_status.game_mode_data.health_state = was_dead and "dead" or (was_knocked_down and "knocked_down" or "alive")
+								p_status.game_mode_data.health_percentage = perm_hp_percent
+								p_status.game_mode_data.temporary_health_percentage = temp_hp_percent
+							end
+						end
+					end)
+
+					-- 3. Restore Ammo
+					pcall(function()
+						if pl_data.ammo and pl_data.ammo.slot_ranged then
+							local target_fraction = pl_data.ammo.slot_ranged
+							local ammo_system = Managers.state.entity:system("ammo_system")
+							if ammo_system then
+								local exts_by_owner = ammo_system._unit_extensions_by_owner or ammo_system._unit_extensions_by_owener
+								if exts_by_owner and exts_by_owner[pl_unit] then
+									for _, ext in ipairs(exts_by_owner[pl_unit]) do
+										if ext.slot_name == "slot_ranged" then
+											local m_ammo = ext:max_ammo()
+											local target_count = math.round(m_ammo * target_fraction)
+											local clip_size = ext._ammo_per_clip or m_ammo
+											local in_clip = math.min(clip_size, target_count)
+											ext._current_ammo = in_clip
+											ext._available_ammo = math.max(target_count - in_clip, 0)
+											if ext._update_anim_ammo then
+												ext:_update_anim_ammo()
+											end
+										end
+									end
+								end
+
+								-- Direct weapon unit ammo extension update
+								local inv_ext = ScriptUnit.has_extension(pl_unit, "inventory_system") and ScriptUnit.extension(pl_unit, "inventory_system")
+								if inv_ext and inv_ext.get_slot_data then
+									local ranged_slot = inv_ext:get_slot_data("slot_ranged")
+									if ranged_slot then
+										for _, u in ipairs({ ranged_slot.right_unit_1p, ranged_slot.left_unit_1p, ranged_slot.right_unit_3p, ranged_slot.left_unit_3p }) do
+											if u and Unit.alive(u) and ScriptUnit.has_extension(u, "ammo_system") then
+												local a_ext = ScriptUnit.extension(u, "ammo_system")
+												local m_ammo = a_ext:max_ammo()
+												local target_count = math.round(m_ammo * target_fraction)
+												local clip_size = a_ext._ammo_per_clip or m_ammo
+												local in_clip = math.min(clip_size, target_count)
+												a_ext._current_ammo = in_clip
+												a_ext._available_ammo = math.max(target_count - in_clip, 0)
+												if a_ext._update_anim_ammo then
+													a_ext:_update_anim_ammo()
+												end
+											end
+										end
+									end
+								end
+
+								-- For remote clients:
+								if is_remote and ammo_system.give_ammo_fraction_to_owner then
+									ammo_system:give_ammo_fraction_to_owner(pl_unit, target_fraction, false)
+								end
+							end
+						end
+					end)
+
+					-- 4. Restore Consumables (slot_healthkit, slot_potion, slot_grenade)
+					pcall(function()
+						local inventory_ext = ScriptUnit.has_extension(pl_unit, "inventory_system") and ScriptUnit.extension(pl_unit, "inventory_system")
+						if inventory_ext and pl_data.consumables then
+							local consumable_slots = { "slot_healthkit", "slot_potion", "slot_grenade" }
+							for _, slot_name in ipairs(consumable_slots) do
+								local desired_item = pl_data.consumables[slot_name]
+								local current_slot_data = inventory_ext:get_slot_data(slot_name)
+								local current_item_key = current_slot_data and current_slot_data.item_data and current_slot_data.item_data.key
+								local slot_id = NetworkLookup.equipment_slots[slot_name]
+
+								if current_item_key ~= desired_item then
+									-- Destroy current item in slot if different
+									if current_slot_data then
+										inventory_ext:destroy_slot(slot_name)
+										if pl_go_id and network_transmit and slot_id then
+											network_transmit:send_rpc_clients("rpc_destroy_slot", pl_go_id, slot_id)
+										end
+									end
+
+									-- Add desired item
+									if desired_item and rawget(ItemMasterList, desired_item) then
+										inventory_ext:add_equipment(slot_name, desired_item)
+										if pl_go_id and network_transmit and slot_id then
+											local item_id = NetworkLookup.item_names[desired_item]
+											local skin_id = NetworkLookup.weapon_skins["n/a"]
+											if item_id and skin_id then
+												network_transmit:send_rpc_clients("rpc_add_equipment", pl_go_id, slot_id, item_id, skin_id)
+											end
+										end
+									end
+								end
+							end
+						end
+					end)
+
+					-- 5. Restore Career Ability Cooldown
+					pcall(function()
+						local career_ext = ScriptUnit.has_extension(pl_unit, "career_system") and ScriptUnit.extension(pl_unit, "career_system")
+						if career_ext and pl_data.ability_cooldown_percentage then
+							local max_cd = career_ext:get_max_ability_cooldown()
+							local target_cd = max_cd * (1 - pl_data.ability_cooldown_percentage)
+							career_ext._ability_cooldown = target_cd
+							if career_ext._abilities then
+								for _, ability in ipairs(career_ext._abilities) do
+									if ability.cooldowns then
+										for i = 1, #ability.cooldowns do
+											ability.cooldowns[i] = target_cd
+										end
+									end
+								end
+							end
+
+							-- Sync ability_percentage to GameSession so UI and clients update
+							local network_manager = Managers.state.network
+							local game = network_manager and network_manager:game()
+							if game and pl_go_id then
+								local ability_pct = math.clamp(1 - pl_data.ability_cooldown_percentage, 0, 1)
+								GameSession.set_game_object_field(game, pl_go_id, "ability_percentage", ability_pct)
+							end
+
+							-- Immediately freeze cooldown ticking
+							if mod.set_unit_cooldown_paused then
+								mod.set_unit_cooldown_paused(pl_unit, true)
+							end
+						end
+					end)
 				end
 			end
 		end
 	end)
+	if not pl_ok then
+		mod:echo("[Snapshot] Player restore error: " .. tostring(pl_err))
+	end
 
-	-- 6. Destroy random level mobs and recreate exact living enemies safely
-	pcall(function()
+	-- 6. Destroy random level mobs and recreate exact living enemies safely with preserved HP & Reset Horde
+	local en_ok, en_err = pcall(function()
 		local conflict = Managers.state.conflict
 		if conflict then
+			-- Reset horde spawner, terror events & pacing completely
+			if rawget(_G, "TerrorEventMixer") then
+				TerrorEventMixer.reset()
+			end
+
+			if conflict.horde_spawner and conflict.horde_spawner.hordes then
+				table.clear(conflict.horde_spawner.hordes)
+				conflict.horde_spawner._running_horde_type = nil
+				conflict.horde_spawner._running_horde_sound_settings = nil
+			end
+
+			local spawner_sys = Managers.state.entity:system("spawner_system")
+			if spawner_sys and spawner_sys._active_spawners then
+				table.clear(spawner_sys._active_spawners)
+			end
+
+			local current_t = Managers.time:time("game") or 0
+			conflict._next_horde_time = current_t + 120
+			conflict._living_horde = 0
+			conflict._horde_ends_at = 0
+
+			if conflict.pacing then
+				conflict.pacing.total_intensity = 0
+				conflict.pacing.pacing_state = "pacing_build_up"
+			end
+
 			conflict:destroy_all_units()
 
+			local queued_spawns = {}
 			for _, enemy_data in ipairs(snapshot.enemies or {}) do
 				local breed = Breeds[enemy_data.breed_name]
 				-- Security filter: ensure no dummies or heroes are spawned as enemies
@@ -549,7 +815,12 @@ function SnapshotManager:apply_snapshot(snapshot)
 						pcall(function()
 							local pos_box = Vector3Box(pos)
 							local rot_box = QuaternionBox(rot)
-							conflict:spawn_queued_unit(breed, pos_box, rot_box, "snapshot", nil, "snapshot", {})
+							local unit_data = {}
+							conflict:spawn_queued_unit(breed, pos_box, rot_box, "snapshot", nil, "snapshot", {}, nil, unit_data)
+							table.insert(queued_spawns, {
+								unit_data = unit_data,
+								damage_taken = enemy_data.damage_taken or 0,
+							})
 						end)
 					end
 				end
@@ -557,7 +828,6 @@ function SnapshotManager:apply_snapshot(snapshot)
 
 			-- Repeatedly process spawn queue until all queued enemies are instantiated
 			if conflict.update_spawn_queue then
-				local current_t = Managers.time:time("game") or 0
 				local max_iterations = 200
 				local iterations = 0
 				while conflict.spawn_queue_size and conflict.spawn_queue_size > 0 and iterations < max_iterations do
@@ -566,10 +836,29 @@ function SnapshotManager:apply_snapshot(snapshot)
 				end
 			end
 
+			-- Restore each enemy's remaining HP
+			for _, spawn_info in ipairs(queued_spawns) do
+				local enemy_unit = spawn_info.unit_data[1]
+				local damage_taken = spawn_info.damage_taken
+				if enemy_unit and Unit.alive(enemy_unit) and damage_taken > 0 then
+					local h_ext = ScriptUnit.has_extension(enemy_unit, "health_system") and ScriptUnit.extension(enemy_unit, "health_system")
+					if h_ext and h_ext.set_server_damage_taken then
+						local max_hp = h_ext:get_max_health()
+						local safe_damage = math.min(damage_taken, max_hp - 1)
+						if safe_damage > 0 then
+							h_ext:set_server_damage_taken(safe_damage)
+						end
+					end
+				end
+			end
+
 			-- Allow ConflictDirector:update to run for 5 frames to settle physics and navmesh
 			mod._allow_director_updates = 5
 		end
 	end)
+	if not en_ok then
+		mod:echo("[Snapshot] Enemy restore error: " .. tostring(en_err))
+	end
 
 	-- 7. Restore Scoreboard Statistics (Full Rollback to exact snapshot stats & network sync)
 	pcall(function()
@@ -642,17 +931,34 @@ function SnapshotManager:apply_snapshot(snapshot)
 						end
 					end
 
-					-- Explicitly restore damage_dealt and damage_taken with verification
+					-- Explicitly restore damage_dealt with step-by-step debug
 					if saved_entry.scores then
 						if saved_entry.scores.damage_dealt ~= nil then
 							local dmg = tonumber(saved_entry.scores.damage_dealt) or 0
-							local ok = _write_stat_direct(stats_root, dmg, "damage_dealt")
-							if not ok then
+
+							-- Step 1: Check stats_root has the damage_dealt node
+							local dd_node = stats_root["damage_dealt"]
+							mod:echo("[D1] dd_node=" .. tostring(dd_node ~= nil) .. " dmg=" .. tostring(dmg) .. " stats_root_type=" .. type(stats_root))
+
+							if dd_node then
+								-- Step 2: Check current value before write
+								mod:echo("[D2] before_write value=" .. tostring(dd_node.value))
+								-- Step 3: Direct write
+								dd_node.value = dmg
+								dd_node.persistent_value = dmg
+								dd_node.dirty = true
+								-- Step 4: Read back directly from node
+								mod:echo("[D3] after_write node.value=" .. tostring(dd_node.value))
+							else
+								mod:echo("[D2] dd_node is nil! Using modify_stat fallback")
 								local current = statistics_db:get_stat(stats_id, "damage_dealt") or 0
 								pcall(function() statistics_db:modify_stat_by_amount(stats_id, "damage_dealt", dmg - current) end)
 							end
+
+							-- Step 5: Verify via get_stat (reads through the DB)
 							local verify = statistics_db:get_stat(stats_id, "damage_dealt")
-							mod:echo("[Restore] damage_dealt target=" .. tostring(dmg) .. " verify=" .. tostring(verify))
+							mod:echo("[D4] get_stat verify=" .. tostring(verify) .. " (expected " .. tostring(dmg) .. ")")
+
 							if mod.sync_stat_to_clients then
 								mod.sync_stat_to_clients(peer_id, local_player_id, { "damage_dealt" }, dmg)
 							end
