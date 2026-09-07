@@ -1,0 +1,31 @@
+多人reload快照會崩潰，log
+
+GUID: 21387e38-1b36-45fb-a961-7dd79a43ac3e
+Log File: 
+Info Type: 
+-----------------------------------------------
+[Script Error]: ...default_player_unit/player_husk_locomotion_extension.lua:294: bad argument #1 to '__add' (Vector3 expected, got userdata)
+-----------------------------------------------
+[Crash Link]:
+crashify://21387e38-1b36-45fb-a961-7dd79a43ac3e
+
+----------------------
+倒地以後，reload快照可能會變成滿血(因為倒地也有血量)，應該判斷 Snapshot 狀態
+    │
+    ├── 正常 → 正常
+    │
+    ├── 倒地 → 重新套用 knocked-down
+    │
+    └── 死亡 → 重新套用 dead
+	
+	
+
+玩家是否倒地/死亡狀態️ 沒回到快照點，而是一直在計算
+玩家 HP	 沒回到快照點，而是一直在計算
+玩家 THP	 沒回到快照點，而是一直在計算
+玩家彈藥	 沒回到快照點，而是一直在計算
+玩家消耗品	 沒回到快照點，而是一直在計算
+玩家技能 CD 沒回到快照點，而是一直在計算
+敵人剩餘 HP 沒回到快照點，而是一直在計算
+刷潮 沒回到快照點，而是一直在計算
+<<Error Context>>RPC	rpc_chat_messageParameter	6RPC	rpc_chat_messageParameter	6RPC	rpc_chat_messageParameter	6RPC	rpc_chat_messageParameter	6<</Error Context>><<Script Error>>invalid key to 'next'<</Script Error>><<Lua Stack>>  [1] =[C]: in function iterate_query  [2] @scripts/entity_system/systems/dialogues/tag_query_database.lua:322: in function iterate_query  [3] @scripts/entity_system/systems/dialogues/tag_query_database.lua:273: in function iterate_queries  [4] @scripts/entity_system/systems/dialogues/dialogue_system.lua:893:in function <scripts/entity_system/systems/dialogues/dialogue_system.lua:868>  [5] @scripts/entity_system/entity_system_bag.lua:62: in function update  [6] @scripts/entity_system/entity_system.lua:489: in function system_update  [7] @scripts/entity_system/entity_system.lua:470: in function physics_async_update  [8] @scripts/game_state/state_ingame.lua:744: in function physics_async_update  [9] @scripts/game_state/state_ingame.lua:701:in function <scripts/game_state/state_ingame.lua:695>  [10] =[C]: in function update_scene_with_callback  [11] @foundation/scripts/util/script_world.lua:380: in function update  [12] @foundation/scripts/managers/world/world_manager.lua:104: in function update  [13] @scripts/boot.lua:952: in function game_update  [14] @scripts/boot.lua:678:in function <scripts/boot.lua:673><</Lua Stack>><<Lua Locals>>  [2] self = table: 0000000005F50A50; t = 1026.422839966599; query = table: 000000000F016620; query_context = table: 000000000D41C150; source = [Unit \'#ID[23881d88dce83df9]\']; user_context_list = table: 00000000123096F0; nice_array = table: 000000000C781F20  [3] self = table: 0000000005F50A50; out_results = table: 0000000005F509B0; t = 1026.422839966599; result_i = 0; i = 1  [4] self = table: 0000000005F50910; context = table: 0000000003AD9910; t = 126.4228399665991; dt = 0.01067026425153017; tagquery_database = table: 0000000005F50A50; query_results = table: 0000000005F509B0  [5] self = table: 00000000047B8F60; entity_system_update_context = table: 0000000003AD9910; update_function = "physics_async_update"; update_function_list_name = "systems_physics_async_update"; update_list = table: 00000000047B9130; t = 126.4228399665991; i = 4; system = table: 0000000005F50910  [6] self = table: 0000000000448620; update_func = "physics_async_update"; dt = 0.01067026425153017; entity_system_update_context = table: 0000000003AD9910  [7] self = table: 0000000000448620  [8] self = table: 0000000002370260; dt = 0.01067026425153017; t = 126.4228399665991  [11] world = [World]; dt = 0.01067026425153017; t = 288.20520666101947; anim_callback = [function]; scene_callback = [function]; update_done_callback = [function]  [12] self = table: 00000000090505D0; dt = 0.01067026425153017; t = 288.20520666101947; _ = 2; world = [World]  [13] self = table: 0000000000012D80; real_world_dt = 0.01067026425153017; Managers = \n\tui\n\ttwitch\n\tpopup\n\ttoken\n\ttransition\n\tmusic\n\ttime\n\tpersistent_event\n\tfree_flight\n\tirc\n\ttelemetry_events\n\tsimple_popup\n\tbeta_ov...; dt = 0.01067026425153017; t = 288.20520666101947  [14] dt = 0.01067026425153017<</Lua Locals>><<Lua Self>>  [2] rule_id_mapping = table: 0000000005FF1F20; global_context = table: 00000000050963F0; rules_n = 2424; contexts_by_object = table: 0000000005F50500; queries = table: 0000000005F50530; database = [unknown light userdata];   [3] rule_id_mapping = table: 0000000005FF1F20; global_context = table: 00000000050963F0; rules_n = 2424; contexts_by_object = table: 0000000005F50500; queries = table: 0000000005F50530; database = [unknown light userdata];   [4] _tagquery_database = table: 0000000005F50A50; _next_story_line_update_t = 130.01338939539323; _faction_memories = table: 0000000001525550; _wwise_voice_switch_value_indices = table: 00000000015255E0; _use_story_lines = true; NAME = "dialogue_system"; _loaded_event_dialogues = table: 0000000005095540; _playing_dialogues = table: 0000000005F50AC0; statistics_db = table: 000000000338AC50; _input_event_queue_n = 4; _function_command_queue = table: 0000000000EF8BD0; _mission_giver_events = table: 0000000005F50A20; world = [World]; _is_server = true; _network_event_delegate = table: 000000000A8DC610; _unit_extension_data = table: 0000000005F50A90; gui = [Gui]; _query_results = table: 0000000005F509B0; _story_trigger_freezes = 0; wwise_world = [WwiseWorld]; _global_context = table: 00000000050963F0; _dialogues = table: 0000000005FF1EE0; _original_dialogue_settings = table: 0000000001918A90; _dialogue_state_handler = table: 0000000001525410; _flow_calls_implementation = table: 0000000005095570; _playing_units = table: 0000000005F50AF0; _tagquery_loader = table: 0000000005F50490; _markers = table: 0000000005FF1F50; _frozen_unit_extension_data = table: 0000000005F509F0; _entity_manager = table: 0000000001EF8240; _input_event_queue = table: 0000000001525520;   [5] num_systems = 0; systems_unsafe_entity_update = table: 00000000047B
