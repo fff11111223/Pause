@@ -378,6 +378,30 @@ if rawget(_G, "TagQueryDatabase") then
 	end)
 end
 
+-- Guard BossHealthUI to prevent crashes when boss units are destroyed and restored during snapshots
+if rawget(_G, "BossHealthUI") then
+	mod:hook(BossHealthUI, "update", function(func, self, dt, t)
+		if self._detected_boss_units then
+			for i = #self._detected_boss_units, 1, -1 do
+				local data = self._detected_boss_units[i]
+				local unit = data and data.unit
+				if not unit or not Unit.alive(unit) or not ScriptUnit.has_extension(unit, "health_system") then
+					table.remove(self._detected_boss_units, i)
+				end
+			end
+		end
+		return func(self, dt, t)
+	end)
+
+	mod:hook(BossHealthUI, "_update_enemy_portrait_name_and_attributes", function(func, self, boss_data)
+		local unit = boss_data and boss_data.unit
+		if not unit or not Unit.alive(unit) then
+			return "", nil
+		end
+		return func(self, boss_data)
+	end)
+end
+
 -- Hook ConflictDirector to halt AI director/pacing/spawns during pause.
 -- mod._allow_director_updates allows frames through after snapshot restore
 -- so that spawn_queued_unit enemies get flushed from the queue before re-pausing.
