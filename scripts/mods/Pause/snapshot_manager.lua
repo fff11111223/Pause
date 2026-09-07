@@ -30,18 +30,66 @@ local function _get_respawn_handler()
 	return nil
 end
 
+local function _resolve_level_unit(level_object_id, position)
+	if not level_object_id and not position then
+		return nil
+	end
+
+	-- 1. Try resolving via network level object ID (VT2 native GameNetworkManager method)
+	local network_manager = Managers.state and Managers.state.network
+	if level_object_id and network_manager and network_manager.game_object_or_level_unit then
+		local ok, unit = pcall(network_manager.game_object_or_level_unit, network_manager, level_object_id, true)
+		if ok and unit and Unit.alive(unit) then
+			return unit
+		end
+	end
+
+	-- 2. Try resolving via Level.unit_by_index
+	if level_object_id and Managers.world and Managers.world:has_world("level_world") and rawget(_G, "LevelHelper") and rawget(_G, "Level") then
+		local ok, unit = pcall(function()
+			local world = Managers.world:world("level_world")
+			local level = LevelHelper:current_level(world)
+			return Level.unit_by_index(level, level_object_id)
+		end)
+		if ok and unit and Unit.alive(unit) then
+			return unit
+		end
+	end
+
+	-- 3. Position fallback: match against registered spawners in spawner_system
+	if position then
+		local spawner_system = Managers.state and Managers.state.entity and Managers.state.entity:system("spawner_system")
+		if spawner_system and spawner_system._enabled_spawners then
+			local target_pos = Vector3(position[1], position[2], position[3])
+			local closest_spawner = nil
+			local min_dist_sq = 2.25 -- within 1.5m
+			for _, spawner_unit in ipairs(spawner_system._enabled_spawners) do
+				if Unit.alive(spawner_unit) then
+					local dist_sq = Vector3.distance_squared(target_pos, Unit.world_position(spawner_unit, 0))
+					if dist_sq < min_dist_sq then
+						min_dist_sq = dist_sq
+						closest_spawner = spawner_unit
+					end
+				end
+			end
+			if closest_spawner then
+				return closest_spawner
+			end
+		end
+	end
+
+	return nil
+end
+
 local function _resolve_respawn_unit(respawn_unit_data)
 	if not respawn_unit_data then
 		return nil
 	end
 
-	-- 1. Try resolving via network level object ID
-	local network_manager = Managers.state and Managers.state.network
-	if respawn_unit_data.level_object_id and network_manager and network_manager.game_object_or_level_unit then
-		local ok, u = pcall(network_manager.game_object_or_level_unit, network_manager, respawn_unit_data.level_object_id, true)
-		if ok and u and Unit.alive(u) then
-			return u
-		end
+	-- 1. Try resolving via standard level unit resolution
+	local u = _resolve_level_unit(respawn_unit_data.level_object_id, respawn_unit_data.position)
+	if u and Unit.alive(u) then
+		return u
 	end
 
 	-- 2. Try resolving via RespawnHandler registered units matching coordinates
@@ -109,6 +157,8 @@ function SnapshotManager:collect_snapshot()
 		level_analysis = nil,
 		players = {},
 		enemies = {},
+		horde_spawner = nil,
+		conflict_pacing = nil,
 		scoreboard = {},
 	}
 
@@ -288,6 +338,9 @@ function SnapshotManager:collect_snapshot()
 				respawn_state = respawn_state,
 				respawn_remaining_time = respawn_remaining_time,
 				respawn_unit_data = respawn_unit_data,
+				-- Pacing Intensity
+				pacing_intensity = status_ext and status_ext.pacing_intensity or 0,
+				pacing_intensity_decay_delay = status_ext and status_ext.pacing_intensity_decay_delay or 0,
 				-- Exact raw Ability Cooldown in seconds
 				ability_cooldown = ability_cooldown,
 				max_ability_cooldown = max_ability_cooldown,
@@ -405,6 +458,290 @@ function SnapshotManager:collect_snapshot()
 				end
 			end
 		end
+	end)
+
+	-- 8. HordeSpawner State (Preserve active and queued hordes, timers, spawners, etc.)
+	pcall(function()
+		local conflict = Managers.state.conflict
+		local horde_spawner = conflict and conflict.horde_spawner
+		if not horde_spawner then
+			return
+		end
+
+		local current_t = Managers.time and Managers.time:has_timer("game") and Managers.time:time("game") or 0
+		local saved_hordes = {}
+
+		if horde_spawner.hordes then
+			for _, horde in ipairs(horde_spawner.hordes) do
+				local start_time = horde.start_time or current_t
+				local start_time_remaining = math.max(start_time - current_t, 0)
+				local end_time_remaining = horde.end_time and math.max(horde.end_time - current_t, 0) or nil
+
+				-- Main target pos & epicenter pos (unbox Vector3Box if present)
+				local main_target_pos = nil
+				if horde.main_target_pos and horde.main_target_pos.unbox then
+					local p = horde.main_target_pos:unbox()
+					main_target_pos = { p.x, p.y, p.z }
+				elseif type(horde.main_target_pos) == "table" and horde.main_target_pos[1] then
+					main_target_pos = { horde.main_target_pos[1], horde.main_target_pos[2], horde.main_target_pos[3] }
+				end
+
+				local epicenter_pos = nil
+				if horde.epicenter_pos and horde.epicenter_pos.unbox then
+					local p = horde.epicenter_pos:unbox()
+					epicenter_pos = { p.x, p.y, p.z }
+				elseif type(horde.epicenter_pos) == "table" and horde.epicenter_pos[1] then
+					epicenter_pos = { horde.epicenter_pos[1], horde.epicenter_pos[2], horde.epicenter_pos[3] }
+				end
+
+				-- Group template (sanitize userdata if present)
+				local saved_group_template = nil
+				if horde.group_template then
+					saved_group_template = {
+						id = horde.group_template.id or horde.group_id,
+						template = horde.group_template.template or "horde",
+						size = horde.group_template.size,
+					}
+				end
+
+				-- Sound settings
+				local saved_sound_settings = nil
+				if horde.sound_settings then
+					saved_sound_settings = table.clone(horde.sound_settings)
+				end
+
+				-- Optional data
+				local saved_optional_data = nil
+				if horde.optional_data and type(horde.optional_data) == "table" then
+					saved_optional_data = {}
+					for k, v in pairs(horde.optional_data) do
+						if type(v) ~= "userdata" and type(v) ~= "function" then
+							saved_optional_data[k] = v
+						end
+					end
+				end
+
+				-- Source unit (for event hordes)
+				local source_unit_data = nil
+				if horde.source_unit and Unit.alive(horde.source_unit) then
+					local s_id = Managers.state.network and Managers.state.network:level_object_id(horde.source_unit)
+					local sp = Unit.world_position(horde.source_unit, 0)
+					source_unit_data = {
+						level_object_id = s_id,
+						position = { sp.x, sp.y, sp.z },
+					}
+				end
+
+				-- Horde spawns
+				local saved_horde_spawns = nil
+				if horde.horde_spawns then
+					saved_horde_spawns = {}
+					for _, hs in ipairs(horde.horde_spawns) do
+						local spawner_data = nil
+						if hs.spawner and Unit.alive(hs.spawner) then
+							local sp_id = Managers.state.network and Managers.state.network:level_object_id(hs.spawner)
+							local sp_pos = Unit.world_position(hs.spawner, 0)
+							spawner_data = {
+								level_object_id = sp_id,
+								position = { sp_pos.x, sp_pos.y, sp_pos.z },
+							}
+						end
+
+						local all_done_spawned_remaining = hs.all_done_spawned_time and math.max(hs.all_done_spawned_time - current_t, 0) or nil
+
+						table.insert(saved_horde_spawns, {
+							num_to_spawn = hs.num_to_spawn or 0,
+							spawner_data = spawner_data,
+							spawn_list = table.clone(hs.spawn_list or {}),
+							hidden = not not hs.hidden,
+							done = not not hs.done,
+							all_done_spawned_remaining = all_done_spawned_remaining,
+						})
+					end
+				end
+
+				-- Cover spawns
+				local saved_cover_spawns = nil
+				if horde.cover_spawns then
+					saved_cover_spawns = {}
+					for _, cs in ipairs(horde.cover_spawns) do
+						local cover_data = nil
+						if cs.cover_point_unit and Unit.alive(cs.cover_point_unit) then
+							local cp_id = Managers.state.network and Managers.state.network:level_object_id(cs.cover_point_unit)
+							local cp_pos = Unit.world_position(cs.cover_point_unit, 0)
+							cover_data = {
+								level_object_id = cp_id,
+								position = { cp_pos.x, cp_pos.y, cp_pos.z },
+							}
+						end
+
+						local next_spawn_remaining = cs.next_spawn_time and math.max(cs.next_spawn_time - current_t, 0) or 0
+
+						table.insert(saved_cover_spawns, {
+							num_to_spawn = cs.num_to_spawn or 0,
+							cover_data = cover_data,
+							spawn_list = table.clone(cs.spawn_list or {}),
+							next_spawn_remaining = next_spawn_remaining,
+							dont_move = not not cs.dont_move,
+						})
+					end
+				end
+
+				-- Terror event ids
+				local saved_terror_ids = nil
+				if horde.terror_event_ids then
+					saved_terror_ids = table.clone(horde.terror_event_ids)
+				end
+
+				-- Variant (composition)
+				local saved_variant = nil
+				if horde.variant and type(horde.variant) == "table" then
+					saved_variant = table.clone(horde.variant)
+				end
+
+				local horde_entry = {
+					horde_type = horde.horde_type or "vector",
+					started = not not horde.started,
+					start_time_remaining = start_time_remaining,
+					end_time_remaining = end_time_remaining,
+					spawned = horde.spawned or 0,
+					num_to_spawn = horde.num_to_spawn or 0,
+					group_id = horde.group_id,
+					side_id = horde.side_id or 2,
+					silent = not not horde.silent,
+					main_target_pos = main_target_pos,
+					epicenter_pos = epicenter_pos,
+					group_template = saved_group_template,
+					sound_settings = saved_sound_settings,
+					optional_data = saved_optional_data,
+					source_unit_data = source_unit_data,
+					horde_spawns = saved_horde_spawns,
+					cover_spawns = saved_cover_spawns,
+					terror_event_ids = saved_terror_ids,
+					composition_type = horde.composition_type,
+					limit_spawners = horde.limit_spawners,
+					strictly = horde.strictly,
+					use_closest_spawners = horde.use_closest_spawners,
+					variant = saved_variant,
+					amount = horde.amount,
+					failed = not not horde.failed,
+				}
+
+				table.insert(saved_hordes, horde_entry)
+			end
+		end
+
+		snapshot.horde_spawner = {
+			running_horde_type = horde_spawner._running_horde_type,
+			running_horde_sound_settings = horde_spawner._running_horde_sound_settings and table.clone(horde_spawner._running_horde_sound_settings) or nil,
+			num_paced_hordes = horde_spawner.num_paced_hordes or 0,
+			last_paced_horde_type = horde_spawner.last_paced_horde_type,
+			hordes = saved_hordes,
+		}
+	end)
+
+	-- 9. Conflict Director Pacing & Horde Timing State
+	pcall(function()
+		local conflict = Managers.state.conflict
+		if not conflict then
+			return
+		end
+
+		local current_t = Managers.time and Managers.time:has_timer("game") and Managers.time:time("game") or 0
+		local pacing = conflict.pacing
+
+		local pacing_data = nil
+		if pacing then
+			local state_start_elapsed = math.max(current_t - (pacing._state_start_time or current_t), 0)
+			local end_pacing_remaining = nil
+			if pacing._end_pacing_time then
+				end_pacing_remaining = math.max(pacing._end_pacing_time - current_t, 0)
+			end
+
+			pacing_data = {
+				pacing_state = pacing.pacing_state,
+				total_intensity = pacing.total_intensity or 0,
+				player_intensity = pacing.player_intensity and table.clone(pacing.player_intensity) or {},
+				state_start_time_elapsed = state_start_elapsed,
+				end_pacing_time_remaining = end_pacing_remaining,
+				threat_population = pacing._threat_population,
+				specials_population = pacing._specials_population,
+				horde_population = pacing._horde_population,
+			}
+		end
+
+		local next_horde_rem = nil
+		if conflict._next_horde_time == math.huge then
+			next_horde_rem = "huge"
+		elseif type(conflict._next_horde_time) == "number" then
+			next_horde_rem = math.max(conflict._next_horde_time - current_t, 0)
+		end
+
+		local horde_ends_rem = nil
+		if conflict._horde_ends_at == math.huge then
+			horde_ends_rem = "huge"
+		elseif type(conflict._horde_ends_at) == "number" then
+			horde_ends_rem = math.max(conflict._horde_ends_at - current_t, 0)
+		end
+
+		-- specials_pacing (if active)
+		local specials_pacing_data = nil
+		local sp_pacing = conflict.specials_pacing
+		if sp_pacing and sp_pacing._specials_slots then
+			local saved_slots = {}
+			for i, slot in ipairs(sp_pacing._specials_slots) do
+				local slot_time_rem = nil
+				if type(slot.time) == "number" then
+					slot_time_rem = math.max(slot.time - current_t, 0)
+				end
+				local stinger_rem = nil
+				if type(slot.special_spawn_stinger_at_t) == "number" then
+					stinger_rem = math.max(slot.special_spawn_stinger_at_t - current_t, 0)
+				end
+				saved_slots[i] = {
+					state = slot.state,
+					breed = slot.breed,
+					time_remaining = slot_time_rem,
+					health_modifier = slot.health_modifier,
+					special_spawn_stinger = slot.special_spawn_stinger,
+					stinger_remaining = stinger_rem,
+				}
+			end
+
+			local saved_state_data = nil
+			if sp_pacing._state_data then
+				local sd = sp_pacing._state_data
+				saved_state_data = {
+					override_breed_name = sd.override_breed_name,
+					coordinated_timer_remaining = sd.coordinated_timer and math.max(sd.coordinated_timer - current_t, 0) or nil,
+					coord_time_check_remaining = sd.coord_time_check and math.max(sd.coord_time_check - current_t, 0) or nil,
+				}
+			end
+
+			specials_pacing_data = {
+				slots = saved_slots,
+				state_data = saved_state_data,
+				disabled = sp_pacing._disabled,
+				specials_timer = sp_pacing._specials_timer,
+			}
+		end
+
+		snapshot.conflict_pacing = {
+			pacing = pacing_data,
+			next_horde_time_remaining = next_horde_rem,
+			horde_ends_at_remaining = horde_ends_rem,
+			multiple_horde_count = conflict._multiple_horde_count,
+			current_wave_composition = conflict._current_wave_composition,
+			wave = conflict._wave,
+			living_horde = conflict._living_horde or 0,
+			delay_horde = conflict.delay_horde,
+			delay_specials = conflict.delay_specials,
+			delay_mini_patrol = conflict.delay_mini_patrol,
+			event_delay = conflict.event_delay,
+			threat_value = conflict.threat_value or 0,
+			num_aggroed = conflict.num_aggroed or 0,
+			specials_pacing = specials_pacing_data,
+		}
 	end)
 
 	return snapshot
@@ -869,6 +1206,16 @@ function SnapshotManager:apply_snapshot(snapshot)
 							end
 						end
 
+						-- Restore Player Pacing Intensity
+						if status_ext then
+							if pl_data.pacing_intensity ~= nil then
+								status_ext.pacing_intensity = pl_data.pacing_intensity
+							end
+							if pl_data.pacing_intensity_decay_delay ~= nil then
+								status_ext.pacing_intensity_decay_delay = pl_data.pacing_intensity_decay_delay
+							end
+						end
+
 						-- Sync party game_mode_data
 						pcall(function()
 							local party_manager = Managers.party
@@ -1031,36 +1378,10 @@ function SnapshotManager:apply_snapshot(snapshot)
 		mod:echo("[Snapshot] Player restore error: " .. tostring(pl_err))
 	end
 
-	-- 6. Destroy random level mobs and recreate exact living enemies safely with preserved HP & Reset Horde
+	-- 6. Destroy random level mobs and recreate exact living enemies safely with preserved HP
 	local en_ok, en_err = pcall(function()
 		local conflict = Managers.state.conflict
 		if conflict then
-			-- Reset horde spawner, terror events & pacing completely
-			if rawget(_G, "TerrorEventMixer") then
-				TerrorEventMixer.reset()
-			end
-
-			if conflict.horde_spawner and conflict.horde_spawner.hordes then
-				table.clear(conflict.horde_spawner.hordes)
-				conflict.horde_spawner._running_horde_type = nil
-				conflict.horde_spawner._running_horde_sound_settings = nil
-			end
-
-			local spawner_sys = Managers.state.entity:system("spawner_system")
-			if spawner_sys and spawner_sys._active_spawners then
-				table.clear(spawner_sys._active_spawners)
-			end
-
-			local current_t = Managers.time:time("game") or 0
-			conflict._next_horde_time = current_t + 120
-			conflict._living_horde = 0
-			conflict._horde_ends_at = 0
-
-			if conflict.pacing then
-				conflict.pacing.total_intensity = 0
-				conflict.pacing.pacing_state = "pacing_build_up"
-			end
-
 			conflict:destroy_all_units()
 
 			local package_loader = conflict.enemy_package_loader
@@ -1176,7 +1497,310 @@ function SnapshotManager:apply_snapshot(snapshot)
 		mod:echo("[Snapshot] Enemy restore error: " .. tostring(en_err))
 	end
 
-	-- 7. Restore Scoreboard Statistics (Full Rollback to exact snapshot stats & network sync)
+	-- 7. Restore HordeSpawner State (Active & Queued Hordes)
+	local horde_ok, horde_err = pcall(function()
+		local conflict = Managers.state.conflict
+		local horde_spawner = conflict and conflict.horde_spawner
+		local spawner_sys = Managers.state.entity and Managers.state.entity:system("spawner_system")
+		local current_t = Managers.time and Managers.time:has_timer("game") and Managers.time:time("game") or 0
+
+		if not horde_spawner then
+			return
+		end
+
+		-- Clear old active spawners from the pre-crash session
+		if spawner_sys and spawner_sys._active_spawners then
+			table.clear(spawner_sys._active_spawners)
+		end
+
+		local horde_data = snapshot.horde_spawner
+		if horde_data and horde_data.hordes and #horde_data.hordes > 0 then
+			table.clear(horde_spawner.hordes)
+
+			for _, h_data in ipairs(horde_data.hordes) do
+				local horde = {
+					horde_type = h_data.horde_type or "vector",
+					started = h_data.started == true,
+					spawned = h_data.spawned or 0,
+					num_to_spawn = h_data.num_to_spawn or 0,
+					group_id = h_data.group_id,
+					side_id = h_data.side_id or 2,
+					silent = h_data.silent == true,
+					composition_type = h_data.composition_type,
+					limit_spawners = h_data.limit_spawners,
+					strictly = h_data.strictly,
+					use_closest_spawners = h_data.use_closest_spawners,
+					amount = h_data.amount,
+					failed = h_data.failed == true,
+					variant = h_data.variant and table.clone(h_data.variant) or nil,
+					terror_event_ids = h_data.terror_event_ids and table.clone(h_data.terror_event_ids) or nil,
+					sound_settings = h_data.sound_settings and table.clone(h_data.sound_settings) or nil,
+					optional_data = h_data.optional_data and table.clone(h_data.optional_data) or nil,
+				}
+
+				-- Reconstruct time fields: new game time + remaining time
+				if h_data.started then
+					horde.start_time = current_t - 0.1
+				else
+					horde.start_time = current_t + (h_data.start_time_remaining or 0)
+				end
+
+				if h_data.end_time_remaining then
+					horde.end_time = current_t + h_data.end_time_remaining
+				end
+
+				-- Reconstruct Vector3Box for main_target_pos and epicenter_pos
+				if h_data.main_target_pos then
+					local p = h_data.main_target_pos
+					horde.main_target_pos = Vector3Box(Vector3(p[1], p[2], p[3]))
+				end
+				if h_data.epicenter_pos then
+					local p = h_data.epicenter_pos
+					horde.epicenter_pos = Vector3Box(Vector3(p[1], p[2], p[3]))
+				end
+
+				-- Reconstruct group_template
+				if h_data.group_template then
+					horde.group_template = {
+						id = h_data.group_template.id or h_data.group_id,
+						template = h_data.group_template.template or "horde",
+						size = h_data.group_template.size,
+					}
+				elseif h_data.group_id then
+					horde.group_template = {
+						id = h_data.group_id,
+						template = "horde",
+					}
+				end
+
+				-- Reconstruct source_unit for event hordes
+				if h_data.source_unit_data then
+					horde.source_unit = _resolve_level_unit(h_data.source_unit_data.level_object_id, h_data.source_unit_data.position)
+				end
+
+				-- Reconstruct horde_spawns
+				if h_data.horde_spawns then
+					horde.horde_spawns = {}
+					for _, hs_data in ipairs(h_data.horde_spawns) do
+						local spawner_unit = nil
+						if hs_data.spawner_data then
+							spawner_unit = _resolve_level_unit(hs_data.spawner_data.level_object_id, hs_data.spawner_data.position)
+						end
+
+						local all_done_time = nil
+						if hs_data.all_done_spawned_remaining then
+							all_done_time = current_t + hs_data.all_done_spawned_remaining
+						elseif hs_data.done then
+							all_done_time = current_t - 0.1
+						end
+
+						local hs_entry = {
+							num_to_spawn = hs_data.num_to_spawn or 0,
+							spawner = spawner_unit,
+							spawn_list = table.clone(hs_data.spawn_list or {}),
+							hidden = hs_data.hidden == true,
+							done = hs_data.done == true,
+							all_done_spawned_time = all_done_time,
+						}
+						table.insert(horde.horde_spawns, hs_entry)
+
+						-- If horde was in-progress and this spawner is not done, re-activate in spawner_system
+						if h_data.started and not hs_data.done and spawner_unit and Unit.alive(spawner_unit) and #hs_entry.spawn_list > 0 then
+							if spawner_sys and spawner_sys.spawn_horde then
+								pcall(function()
+									spawner_sys:spawn_horde(spawner_unit, hs_entry.spawn_list, horde.side_id, horde.group_template, horde.optional_data)
+								end)
+							end
+						end
+					end
+				end
+
+				-- Reconstruct cover_spawns
+				if h_data.cover_spawns then
+					horde.cover_spawns = {}
+					for _, cs_data in ipairs(h_data.cover_spawns) do
+						local cover_point_unit = nil
+						if cs_data.cover_data then
+							cover_point_unit = _resolve_level_unit(cs_data.cover_data.level_object_id, cs_data.cover_data.position)
+						end
+
+						local next_spawn_time = current_t + (cs_data.next_spawn_remaining or 0)
+
+						local cs_entry = {
+							num_to_spawn = cs_data.num_to_spawn or 0,
+							cover_point_unit = cover_point_unit,
+							spawn_list = table.clone(cs_data.spawn_list or {}),
+							next_spawn_time = next_spawn_time,
+							dont_move = cs_data.dont_move == true,
+						}
+						table.insert(horde.cover_spawns, cs_entry)
+					end
+				end
+
+				table.insert(horde_spawner.hordes, horde)
+			end
+
+			-- Restore running horde audio & type
+			horde_spawner._running_horde_type = horde_data.running_horde_type
+			horde_spawner._running_horde_sound_settings = horde_data.running_horde_sound_settings
+			horde_spawner.num_paced_hordes = horde_data.num_paced_hordes or horde_spawner.num_paced_hordes
+			horde_spawner.last_paced_horde_type = horde_data.last_paced_horde_type or horde_spawner.last_paced_horde_type
+		else
+			-- No active horde in snapshot: clean state
+			table.clear(horde_spawner.hordes)
+			horde_spawner._running_horde_type = nil
+			horde_spawner._running_horde_sound_settings = nil
+		end
+	end)
+	if not horde_ok then
+		mod:echo("[Snapshot] Horde restore error: " .. tostring(horde_err))
+	end
+
+	-- 8. Restore Conflict Director Pacing & Horde Timing State
+	local pacing_ok, pacing_err = pcall(function()
+		local conflict = Managers.state.conflict
+		if not conflict or not snapshot.conflict_pacing then
+			return
+		end
+
+		local current_t = Managers.time and Managers.time:has_timer("game") and Managers.time:time("game") or 0
+		local cp_data = snapshot.conflict_pacing
+		local p_data = cp_data.pacing
+
+		-- Restore Pacing
+		if p_data and conflict.pacing then
+			local pacing = conflict.pacing
+
+			-- Exact restore of pacing_state (never blindly reset to pacing_build_up!)
+			local target_state = p_data.pacing_state or "pacing_build_up"
+			local old_state = pacing.pacing_state
+			pacing.pacing_state = target_state
+
+			-- Sync pacing state across network if changed
+			if old_state ~= target_state and rawget(_G, "NetworkLookup") and NetworkLookup.pacing then
+				pcall(function()
+					local pacing_id = NetworkLookup.pacing[target_state]
+					if pacing_id and Managers.state.network and Managers.state.network.network_transmit then
+						Managers.state.network.network_transmit:send_rpc_all("rpc_pacing_changed", pacing_id)
+					end
+				end)
+			end
+
+			-- Exact restore of total_intensity (never reset to 0!)
+			pacing.total_intensity = p_data.total_intensity or 0
+			if p_data.player_intensity then
+				pacing.player_intensity = table.clone(p_data.player_intensity)
+			end
+
+			-- Reconstruct timers using new game time
+			if p_data.state_start_time_elapsed then
+				pacing._state_start_time = math.max(current_t - p_data.state_start_time_elapsed, 0)
+			else
+				pacing._state_start_time = current_t
+			end
+
+			if p_data.end_pacing_time_remaining then
+				pacing._end_pacing_time = current_t + p_data.end_pacing_time_remaining
+			else
+				pacing._end_pacing_time = nil
+			end
+
+			-- Restore population multipliers
+			if p_data.threat_population ~= nil then
+				pacing._threat_population = p_data.threat_population
+			end
+			if p_data.specials_population ~= nil then
+				pacing._specials_population = p_data.specials_population
+			end
+			if p_data.horde_population ~= nil then
+				pacing._horde_population = p_data.horde_population
+			end
+		end
+
+		-- Restore ConflictDirector timers and horde pacing
+		if cp_data.next_horde_time_remaining == "huge" then
+			conflict._next_horde_time = math.huge
+		elseif type(cp_data.next_horde_time_remaining) == "number" then
+			conflict._next_horde_time = current_t + cp_data.next_horde_time_remaining
+		else
+			conflict._next_horde_time = nil
+		end
+
+		if cp_data.horde_ends_at_remaining == "huge" then
+			conflict._horde_ends_at = math.huge
+		elseif type(cp_data.horde_ends_at_remaining) == "number" then
+			conflict._horde_ends_at = current_t + cp_data.horde_ends_at_remaining
+		end
+
+		conflict._multiple_horde_count = cp_data.multiple_horde_count
+		conflict._current_wave_composition = cp_data.current_wave_composition
+		conflict._wave = cp_data.wave
+		if cp_data.living_horde ~= nil then
+			conflict._living_horde = cp_data.living_horde
+		end
+		if cp_data.delay_horde ~= nil then
+			conflict.delay_horde = cp_data.delay_horde
+		end
+		if cp_data.delay_specials ~= nil then
+			conflict.delay_specials = cp_data.delay_specials
+		end
+		if cp_data.delay_mini_patrol ~= nil then
+			conflict.delay_mini_patrol = cp_data.delay_mini_patrol
+		end
+		if cp_data.event_delay ~= nil then
+			conflict.event_delay = cp_data.event_delay
+		end
+		if cp_data.threat_value ~= nil then
+			conflict.threat_value = cp_data.threat_value
+		end
+		if cp_data.num_aggroed ~= nil then
+			conflict.num_aggroed = cp_data.num_aggroed
+		end
+
+		-- Restore specials_pacing (if active)
+		if cp_data.specials_pacing and conflict.specials_pacing then
+			local sp = conflict.specials_pacing
+			local sp_data = cp_data.specials_pacing
+			if sp_data.disabled ~= nil then
+				sp._disabled = sp_data.disabled
+			end
+			if sp_data.specials_timer ~= nil then
+				sp._specials_timer = sp_data.specials_timer
+			end
+			if sp_data.slots and sp._specials_slots then
+				for i, slot_data in ipairs(sp_data.slots) do
+					local slot = sp._specials_slots[i]
+					if slot then
+						slot.state = slot_data.state or slot.state
+						slot.breed = slot_data.breed or slot.breed
+						if type(slot_data.time_remaining) == "number" then
+							slot.time = current_t + slot_data.time_remaining
+						end
+						slot.health_modifier = slot_data.health_modifier
+						slot.special_spawn_stinger = slot_data.special_spawn_stinger
+						if type(slot_data.stinger_remaining) == "number" then
+							slot.special_spawn_stinger_at_t = current_t + slot_data.stinger_remaining
+						end
+					end
+				end
+			end
+			if sp_data.state_data and sp._state_data then
+				local sd = sp_data.state_data
+				sp._state_data.override_breed_name = sd.override_breed_name
+				if type(sd.coordinated_timer_remaining) == "number" then
+					sp._state_data.coordinated_timer = current_t + sd.coordinated_timer_remaining
+				end
+				if type(sd.coord_time_check_remaining) == "number" then
+					sp._state_data.coord_time_check = current_t + sd.coord_time_check_remaining
+				end
+			end
+		end
+	end)
+	if not pacing_ok then
+		mod:echo("[Snapshot] Conflict pacing restore error: " .. tostring(pacing_err))
+	end
+
+	-- 9. Restore Scoreboard Statistics (Full Rollback to exact snapshot stats & network sync)
 	pcall(function()
 		local statistics_db = Managers.player and Managers.player:statistics_db()
 		local current_players = Managers.player and Managers.player:players()
