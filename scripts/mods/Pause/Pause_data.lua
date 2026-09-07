@@ -5,6 +5,7 @@ mod.SETTING_NAMES = {
 	SAVE_SNAPSHOT = "save_snapshot",
 	RESTORE_SNAPSHOT = "restore_snapshot",
 	AUTO_SNAPSHOT_INTERVAL = "auto_snapshot_interval",
+	ENABLE_AUTO_SNAPSHOT = "enable_auto_snapshot",
 }
 
 local mod_data = {
@@ -36,6 +37,13 @@ mod_data.options_widgets = {
 		["tooltip"] = mod:localize("restore_snapshot_hotkey_tooltip"),
 		["default_value"] = {},
 		["action"] = "do_restore_snapshot",
+	},
+	{
+		["setting_name"] = mod.SETTING_NAMES.ENABLE_AUTO_SNAPSHOT,
+		["widget_type"] = "checkbox",
+		["text"] = mod:localize("enable_auto_snapshot"),
+		["tooltip"] = mod:localize("enable_auto_snapshot_tooltip"),
+		["default_value"] = true,
 	},
 	{
 		["setting_name"] = mod.SETTING_NAMES.AUTO_SNAPSHOT_INTERVAL,

@@ -34,6 +34,16 @@ return {
 		["zh-tw"] = "讀取並套用當前關卡快照的快捷鍵。",
 		zh = "读取并套用当前关卡快照的快捷键。",
 	},
+	enable_auto_snapshot = {
+		en = "Enable Auto Snapshot",
+		["zh-tw"] = "啟用定時自動快照",
+		zh = "启用定时自动快照",
+	},
+	enable_auto_snapshot_tooltip = {
+		en = "Periodically save match snapshots automatically. Turn off to only save snapshots manually.",
+		["zh-tw"] = "每隔設定的時間自動在背景儲存戰局快照。關閉後僅能透過快捷鍵或指令手動儲存。",
+		zh = "每隔设定的时间自动在背景储存战局快照。关闭后仅能通过快捷键或指令手动储存。",
+	},
 	auto_snapshot_interval = {
 		en = "Auto Snapshot Interval (seconds)",
 		["zh-tw"] = "自動快照間隔（秒）",
