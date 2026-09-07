@@ -10,7 +10,7 @@ mod.SETTING_NAMES = {
 
 local mod_data = {
 	name = "Pause",
-	description = mod:localize("mod_description"),
+	description = mod:localize("暫停與快照"),
 }
 
 mod_data.options_widgets = {
@@ -50,7 +50,7 @@ mod_data.options_widgets = {
 		["widget_type"] = "numeric",
 		["text"] = mod:localize("auto_snapshot_interval"),
 		["tooltip"] = mod:localize("auto_snapshot_interval_tooltip"),
-		["range"] = { 30, 300 },
+		["range"] = { 10, 300 },
 		["default_value"] = 60,
 	},
 }
