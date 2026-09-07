@@ -10,6 +10,120 @@ SnapshotManager.__index = SnapshotManager
 
 local AUTO_SNAPSHOT_INTERVAL = 60 -- Default interval in seconds
 
+-- A unit may be alive before the network manager has registered a game object
+-- for it.  Read the storage map directly so readiness checks never invoke a
+-- network helper that can assert during that short initialization window.
+local function _game_object_id_if_ready(unit)
+	local unit_storage = Managers.state and Managers.state.unit_storage
+	return unit_storage and unit_storage.bimap_goid_unit and unit_storage.bimap_goid_unit[unit] or nil
+end
+
+-- Apply the equipment portion of a player snapshot only after the player's
+-- network unit and inventory extension have both finished spawning.
+local function _restore_player_equipment(pl_unit, pl_data, pl_go_id, is_remote, network_transmit)
+	if not pl_go_id or not pl_unit or not Unit.alive(pl_unit) then
+		return false
+	end
+
+	local inventory_ext = ScriptUnit.has_extension(pl_unit, "inventory_system") and ScriptUnit.extension(pl_unit, "inventory_system")
+	if not inventory_ext or not inventory_ext.get_slot_data then
+		return false
+	end
+	-- The default melee and ranged items establish the attachment hierarchy used
+	-- by every later equipment operation.  Wait for both rather than treating an
+	-- early inventory extension as fully initialized.
+	if not inventory_ext:get_slot_data("slot_melee") or not inventory_ext:get_slot_data("slot_ranged") then
+		return false
+	end
+
+	if pl_data.ammo and pl_data.ammo.slot_ranged then
+		local ranged_ammo = pl_data.ammo.slot_ranged
+		local ammo_system = Managers.state.entity and Managers.state.entity:system("ammo_system")
+		if ammo_system then
+			local exts_by_owner = ammo_system._unit_extensions_by_owner or ammo_system._unit_extensions_by_owener
+			if exts_by_owner and exts_by_owner[pl_unit] then
+				for _, ext in ipairs(exts_by_owner[pl_unit]) do
+					if ext.slot_name == "slot_ranged" then
+						if type(ranged_ammo) == "table" then
+							ext._current_ammo = ranged_ammo.current_ammo or ext._current_ammo
+							ext._available_ammo = ranged_ammo.available_ammo or ext._available_ammo
+						elseif type(ranged_ammo) == "number" then
+							local max_ammo = ext:max_ammo()
+							local target_count = math.round(max_ammo * ranged_ammo)
+							local clip_size = ext._ammo_per_clip or max_ammo
+							ext._current_ammo = math.min(clip_size, target_count)
+							ext._available_ammo = math.max(target_count - ext._current_ammo, 0)
+						end
+						if ext._update_anim_ammo then
+							ext:_update_anim_ammo()
+						end
+					end
+				end
+			end
+			if is_remote and ammo_system.give_ammo_fraction_to_owner then
+				local max_ammo = type(ranged_ammo) == "table" and ranged_ammo.max_ammo or 1
+				local total_ammo = type(ranged_ammo) == "table" and ((ranged_ammo.current_ammo or 0) + (ranged_ammo.available_ammo or 0)) or 0
+				local fraction = type(ranged_ammo) == "table" and total_ammo / math.max(max_ammo, 1) or ranged_ammo
+				ammo_system:give_ammo_fraction_to_owner(pl_unit, fraction, false)
+			end
+		end
+
+		-- The owner map is not populated for every weapon variant immediately.
+		-- Update its weapon extensions as well so the saved raw ammo counts are
+		-- restored for all ranged weapons.
+		local ranged_slot = inventory_ext:get_slot_data("slot_ranged")
+		if ranged_slot then
+			for _, weapon_unit in ipairs({ ranged_slot.right_unit_1p, ranged_slot.left_unit_1p, ranged_slot.right_unit_3p, ranged_slot.left_unit_3p }) do
+				if weapon_unit and Unit.alive(weapon_unit) and ScriptUnit.has_extension(weapon_unit, "ammo_system") then
+					local ammo_ext = ScriptUnit.extension(weapon_unit, "ammo_system")
+					if type(ranged_ammo) == "table" then
+						ammo_ext._current_ammo = ranged_ammo.current_ammo or ammo_ext._current_ammo
+						ammo_ext._available_ammo = ranged_ammo.available_ammo or ammo_ext._available_ammo
+					elseif type(ranged_ammo) == "number" then
+						local max_ammo = ammo_ext:max_ammo()
+						local target_count = math.round(max_ammo * ranged_ammo)
+						local clip_size = ammo_ext._ammo_per_clip or max_ammo
+						ammo_ext._current_ammo = math.min(clip_size, target_count)
+						ammo_ext._available_ammo = math.max(target_count - ammo_ext._current_ammo, 0)
+					end
+					if ammo_ext._update_anim_ammo then
+						ammo_ext:_update_anim_ammo()
+					end
+				end
+			end
+		end
+	end
+
+	if pl_data.consumables then
+		for _, slot_name in ipairs({ "slot_healthkit", "slot_potion", "slot_grenade" }) do
+			local desired_item = pl_data.consumables[slot_name]
+			local current_slot_data = inventory_ext:get_slot_data(slot_name)
+			local current_item_key = current_slot_data and current_slot_data.item_data and current_slot_data.item_data.key
+			local slot_id = NetworkLookup.equipment_slots[slot_name]
+			if current_item_key ~= desired_item then
+				if current_slot_data then
+					inventory_ext:destroy_slot(slot_name)
+					if network_transmit and slot_id then
+						network_transmit:send_rpc_clients("rpc_destroy_slot", pl_go_id, slot_id)
+					end
+				end
+				if desired_item and rawget(ItemMasterList, desired_item) then
+					inventory_ext:add_equipment(slot_name, desired_item)
+					if network_transmit and slot_id then
+						local item_id = NetworkLookup.item_names[desired_item]
+						local skin_id = NetworkLookup.weapon_skins["n/a"]
+						if item_id and skin_id then
+							network_transmit:send_rpc_clients("rpc_add_equipment", pl_go_id, slot_id, item_id, skin_id)
+						end
+					end
+				end
+			end
+		end
+	end
+
+	return true
+end
+
 local function _get_respawn_handler()
 	local game_mode = Managers.state and Managers.state.game_mode
 	if not game_mode then return nil end
@@ -122,6 +236,8 @@ function SnapshotManager:init()
 	self._level_prompted = false
 	self._last_loaded_level = nil
 	self._pause_after_restore_countdown = nil
+	self._inventory_updates_after_restore_pause = nil
+	self._pending_player_equipment_restores = {}
 end
 
 --- Collect complete level, flow, player, enemy, and scoreboard state
@@ -1100,7 +1216,9 @@ function SnapshotManager:apply_snapshot(snapshot)
 
 				else
 					-- CASE: ALIVE PLAYER (NORMAL OR KNOCKED DOWN)
+					local spawned_player_unit = false
 					if (not matched_player.player_unit or not Unit.alive(matched_player.player_unit)) then
+						spawned_player_unit = true
 						pcall(function()
 							matched_player:spawn(pos, rot, false)
 						end)
@@ -1109,11 +1227,13 @@ function SnapshotManager:apply_snapshot(snapshot)
 					local pl_unit = matched_player.player_unit
 					if pl_unit and Unit.alive(pl_unit) then
 						local is_remote = matched_player.remote
-						local pl_go_id = Managers.state.unit_storage and Managers.state.unit_storage:go_id(pl_unit)
+						local pl_go_id = _game_object_id_if_ready(pl_unit)
 						local locomotion_ext = ScriptUnit.has_extension(pl_unit, "locomotion_system") and ScriptUnit.extension(pl_unit, "locomotion_system")
 
 						-- 1. Teleport player & camera, and broadcast RPC to remote clients
-						if locomotion_ext then
+						-- spawn() already uses pos/rot.  Do not touch first-person or mover
+						-- state again until a newly spawned unit has completed initialization.
+						if not spawned_player_unit and locomotion_ext then
 							locomotion_ext:teleport_to(pos, rot)
 						end
 						if is_remote and pl_go_id and network_transmit then
@@ -1121,7 +1241,7 @@ function SnapshotManager:apply_snapshot(snapshot)
 						end
 
 						local fp_ext = ScriptUnit.has_extension(pl_unit, "first_person_system") and ScriptUnit.extension(pl_unit, "first_person_system")
-						if fp_ext and fp_ext.update_position then
+						if not spawned_player_unit and fp_ext and fp_ext.update_position then
 							fp_ext:update_position()
 						end
 
@@ -1163,7 +1283,12 @@ function SnapshotManager:apply_snapshot(snapshot)
 							if was_knocked_down then
 								-- KNOCKED DOWN
 								status_ext.dead = false
-								if not status_ext:is_knocked_down() then
+								-- A player unit returned by spawn() can be alive before its game
+								-- object is registered.  The StatusUtils helpers call
+								-- GameNetworkManager:unit_game_object_id(), which asserts in that
+								-- small window.  Direct extension state is safe here; defer the
+								-- networked status transition until the unit has a GO id.
+								if pl_go_id and not status_ext:is_knocked_down() then
 									StatusUtils.set_knocked_down_network(pl_unit, true)
 								end
 								health_ext.state = "knocked_down"
@@ -1179,7 +1304,7 @@ function SnapshotManager:apply_snapshot(snapshot)
 
 							else
 								-- NORMAL (ALIVE)
-								if status_ext:is_knocked_down() then
+								if pl_go_id and status_ext:is_knocked_down() then
 									StatusUtils.set_knocked_down_network(pl_unit, false)
 								end
 								if status_ext:is_dead() then
@@ -1188,7 +1313,9 @@ function SnapshotManager:apply_snapshot(snapshot)
 										network_transmit:send_rpc_clients("rpc_status_change_bool", NetworkLookup.statuses.dead, false, pl_go_id, 0)
 									end
 								end
-								StatusUtils.set_revived_network(pl_unit, true)
+								if pl_go_id then
+									StatusUtils.set_revived_network(pl_unit, true)
+								end
 
 								-- Set both state and previous_state to "alive" so engine update() doesn't overwrite health
 								health_ext.state = "alive"
@@ -1233,8 +1360,11 @@ function SnapshotManager:apply_snapshot(snapshot)
 							end
 						end)
 
-						-- 3. Restore Ammo (Exact raw counts)
-						pcall(function()
+						-- 3. Restore Ammo (Exact raw counts).  Updating ammo can drive
+						-- weapon animations, so do not touch it until the player is
+						-- registered with the game session.
+						if pl_go_id and not spawned_player_unit then
+							pcall(function()
 							if pl_data.ammo and pl_data.ammo.slot_ranged then
 								local ranged_ammo = pl_data.ammo.slot_ranged
 								local ammo_system = Managers.state.entity:system("ammo_system")
@@ -1297,10 +1427,15 @@ function SnapshotManager:apply_snapshot(snapshot)
 									ammo_system:give_ammo_fraction_to_owner(pl_unit, frac, false)
 								end
 							end
-						end)
+							end)
+						end
 
 						-- 4. Restore Consumables (slot_healthkit, slot_potion, slot_grenade)
-						pcall(function()
+						-- Adding equipment links it to j_rightweaponattach.  A spawned
+						-- player does not have a valid attachment hierarchy until its GO
+						-- has been registered, so use the same readiness guard here.
+						if pl_go_id and not spawned_player_unit then
+							pcall(function()
 							local inventory_ext = ScriptUnit.has_extension(pl_unit, "inventory_system") and ScriptUnit.extension(pl_unit, "inventory_system")
 							if inventory_ext and pl_data.consumables then
 								local consumable_slots = { "slot_healthkit", "slot_potion", "slot_grenade" }
@@ -1331,7 +1466,19 @@ function SnapshotManager:apply_snapshot(snapshot)
 									end
 								end
 							end
-						end)
+							end)
+						end
+
+						-- spawn() creates the player and weapon hierarchy asynchronously.
+						-- Preserve the snapshot data and apply it as soon as that hierarchy
+						-- is ready instead of discarding ammo or consumable state.
+						if spawned_player_unit then
+							table.insert(self._pending_player_equipment_restores, {
+								player = matched_player,
+								player_data = pl_data,
+								wait_frames = 1,
+							})
+						end
 
 						-- 5. Restore Career Ability Cooldown (Exact raw seconds)
 						pcall(function()
@@ -1409,8 +1556,13 @@ function SnapshotManager:apply_snapshot(snapshot)
 					}
 
 					local spawned_unit = nil
-					-- 1. Try immediate synchronous spawn
-					if conflict.spawn_unit_immediate then
+					-- 1. Only spawn immediately after the breed package has reached every
+					-- peer.  Immediate spawning bypasses ConflictDirector's package
+					-- readiness check and can construct an AI rig without its a_sword /
+					-- weapon attachment nodes.
+					local breed_ready = package_loader and package_loader.is_breed_loaded_on_all_peers
+						and package_loader:is_breed_loaded_on_all_peers(breed.name)
+					if breed_ready and conflict.spawn_unit_immediate then
 						pcall(function()
 							spawned_unit = conflict:spawn_unit_immediate(breed, pos, rot, "snapshot", nil, "snapshot", optional_data)
 						end)
@@ -1926,7 +2078,10 @@ function SnapshotManager:apply_snapshot(snapshot)
 		end
 	end)
 
-	-- 8. Auto-pause game after 3 frames so the engine renders the restored state
+	-- Pause after the usual three-frame restore window.  Let the inventory
+	-- system alone run for a few more paused frames so newly spawned weapons
+	-- can finish linking to their attachment nodes.
+	self._inventory_updates_after_restore_pause = 7
 	self._pause_after_restore_countdown = 3
 
 	local seed_str = tostring(snapshot.level_seed or "default")
@@ -1937,12 +2092,41 @@ end
 
 --- Update loop for periodic auto-snapshot and level-start detection prompt
 function SnapshotManager:update(dt)
-	-- Handle delayed pause countdown after snapshot restore (allows 3 frames to render restored scene)
+	-- Handle delayed pause countdown after snapshot restore (allows player equipment setup to finish)
 	if self._pause_after_restore_countdown then
 		self._pause_after_restore_countdown = self._pause_after_restore_countdown - 1
 		if self._pause_after_restore_countdown <= 0 then
 			self._pause_after_restore_countdown = nil
+			mod._allow_inventory_updates = self._inventory_updates_after_restore_pause or 0
+			self._inventory_updates_after_restore_pause = nil
 			mod:apply_pause_state(true, true)
+		end
+	end
+
+	-- Finish equipment restoration for players who had to be spawned during
+	-- snapshot application.  It retains the exact saved ammo and consumables
+	-- rather than using defaults, including if setup takes past the pause point.
+	local pending = self._pending_player_equipment_restores
+	if pending and #pending > 0 then
+		for i = #pending, 1, -1 do
+			local entry = pending[i]
+			if entry.wait_frames > 0 then
+				entry.wait_frames = entry.wait_frames - 1
+			else
+				local player = entry.player
+				local unit = player and player.player_unit
+				local go_id = unit and Unit.alive(unit) and _game_object_id_if_ready(unit)
+				if go_id then
+					local ok, restored = pcall(_restore_player_equipment, unit, entry.player_data, go_id, player.remote, Managers.state.network and Managers.state.network.network_transmit)
+					if ok and restored then
+						table.remove(pending, i)
+					else
+						-- The inventory extension can exist one frame before all weapon
+						-- units are linked; retry after a small settling window.
+						entry.wait_frames = 2
+					end
+				end
+			end
 		end
 	end
 

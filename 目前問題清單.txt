@@ -81,3 +81,8 @@ Restore 後不是「繼續崩潰前的刷潮狀態」，而是：
 8. 修改完成後檢查 Lua 語法及所有欄位名稱，避免憑空猜 API。
 
 不要只做近似恢復；優先做到「快照當下刷潮進度 → Restore 後繼續原本進度」。
+
+
+
+
+[Script Error]: foundation/scripts/util/error.lua:26: Unit storage does not have a game object id for "[Unit '#ID[d28076aa1c1c64a5]']"

@@ -86,7 +86,9 @@ local function _set_unit_locomotion_disabled(unit, disabled)
 		end
 
 		if Managers.player and Managers.player.is_server and Managers.state.network and Managers.state.unit_storage then
-			local go_id = Managers.state.unit_storage:go_id(unit)
+			-- During spawn, an alive unit can precede its NetworkUnitStorage entry.
+			-- Read the map as a pure readiness check before broadcasting an RPC.
+			local go_id = Managers.state.unit_storage.bimap_goid_unit and Managers.state.unit_storage.bimap_goid_unit[unit]
 			if go_id and NetworkLookup and NetworkLookup.movement_funcs then
 				local movement_func_id = NetworkLookup.movement_funcs.none or 1
 				Managers.state.network.network_transmit:send_rpc_clients("rpc_disable_locomotion", go_id, disabled, movement_func_id)
@@ -406,6 +408,9 @@ end
 -- mod._allow_director_updates allows frames through after snapshot restore
 -- so that spawn_queued_unit enemies get flushed from the queue before re-pausing.
 mod._allow_director_updates = 0
+-- Allows a few inventory updates after a snapshot restore has re-paused.  This
+-- completes weapon attachment setup without resuming gameplay.
+mod._allow_inventory_updates = 0
 mod:hook(ConflictDirector, "update", function(func, self, dt, t)
 	if mod.is_paused then
 		if mod._allow_director_updates and mod._allow_director_updates > 0 then
@@ -428,6 +433,9 @@ end)
 -- Hook Inventory Extension to prevent weapon switching & equipment updates during pause
 mod:hook(SimpleInventoryExtension, "update", function(func, self, unit, input, dt, context, t)
 	if mod.is_paused then
+		if mod._allow_inventory_updates and mod._allow_inventory_updates > 0 then
+			return func(self, unit, input, dt, context, t)
+		end
 		return
 	end
 	return func(self, unit, input, dt, context, t)
@@ -482,6 +490,12 @@ mod.update = function(dt)
 					end
 				end
 			end
+		end
+
+		-- The inventory allowance is frame-based, rather than per unit update,
+		-- so every player's attachment setup gets the same restore window.
+		if mod.is_paused and mod._allow_inventory_updates and mod._allow_inventory_updates > 0 then
+			mod._allow_inventory_updates = mod._allow_inventory_updates - 1
 		end
 	end)
 end
