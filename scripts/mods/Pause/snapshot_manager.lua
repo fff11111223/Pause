@@ -10,7 +10,64 @@ SnapshotManager.__index = SnapshotManager
 
 local AUTO_SNAPSHOT_INTERVAL = 60 -- Default interval in seconds
 
+local function _get_respawn_handler()
+	local game_mode = Managers.state and Managers.state.game_mode
+	if not game_mode then return nil end
+	if game_mode.get_respawn_handler then
+		return game_mode:get_respawn_handler()
+	end
+	if game_mode._spawning_component and game_mode._spawning_component.get_respawn_handler then
+		return game_mode._spawning_component:get_respawn_handler()
+	end
+	if game_mode._game_mode and game_mode._game_mode._spawning_component then
+		local sc = game_mode._game_mode._spawning_component
+		if sc.get_respawn_handler then
+			return sc:get_respawn_handler()
+		elseif sc._respawn_handler then
+			return sc._respawn_handler
+		end
+	end
+	return nil
+end
 
+local function _resolve_respawn_unit(respawn_unit_data)
+	if not respawn_unit_data then
+		return nil
+	end
+
+	-- 1. Try resolving via network level object ID
+	local network_manager = Managers.state and Managers.state.network
+	if respawn_unit_data.level_object_id and network_manager and network_manager.game_object_or_level_unit then
+		local ok, u = pcall(network_manager.game_object_or_level_unit, network_manager, respawn_unit_data.level_object_id, true)
+		if ok and u and Unit.alive(u) then
+			return u
+		end
+	end
+
+	-- 2. Try resolving via RespawnHandler registered units matching coordinates
+	local respawn_handler = _get_respawn_handler()
+	if respawn_handler and respawn_handler._respawn_units and respawn_unit_data.position then
+		local target_pos = Vector3(respawn_unit_data.position[1], respawn_unit_data.position[2], respawn_unit_data.position[3])
+		local closest_unit = nil
+		local min_dist_sq = 4.0 -- Within 2 meters threshold
+		for _, r_data in ipairs(respawn_handler._respawn_units) do
+			local r_unit = r_data.unit
+			if r_unit and Unit.alive(r_unit) then
+				local u_pos = Unit.world_position(r_unit, 0)
+				local dist_sq = Vector3.distance_squared(target_pos, u_pos)
+				if dist_sq < min_dist_sq then
+					min_dist_sq = dist_sq
+					closest_unit = r_unit
+				end
+			end
+		end
+		if closest_unit then
+			return closest_unit
+		end
+	end
+
+	return nil
+end
 
 function SnapshotManager:init()
 	self._auto_timer = 0
@@ -666,8 +723,9 @@ function SnapshotManager:apply_snapshot(snapshot)
 
 					-- Restore native respawn state into party game_mode_data
 					-- Flow:
-					-- 1. If timer not yet expired: data.ready_for_respawn = false, data.respawn_timer = t + remaining -> wait -> expires -> VT2 native finds respawn point -> Respawn
-					-- 2. If timer already expired: data.ready_for_respawn = true, data.respawn_timer = nil -> VT2 native immediately finds respawn point -> Respawn
+					-- 1. If respawn_unit was already designated (or already tied up): restore that exact respawn_unit and ready_for_respawn = true
+					-- 2. If timer already expired: data.ready_for_respawn = true, data.respawn_timer = nil -> VT2 native finds respawn point -> Respawn
+					-- 3. If timer not yet expired: data.ready_for_respawn = false, data.respawn_timer = t + remaining -> wait -> expires -> VT2 native finds respawn point -> Respawn
 					pcall(function()
 						local party_manager = Managers.party
 						if party_manager then
@@ -678,9 +736,12 @@ function SnapshotManager:apply_snapshot(snapshot)
 								data.spawn_state = "despawned"
 								data.health_percentage = 0
 								data.temporary_health_percentage = 0
-								data.respawn_unit = nil
 
-								if pl_data.respawn_state == "ready_for_respawn" or pl_data.respawn_state == "respawn" then
+								-- Resolve and restore pre-selected Respawn Unit if one was saved
+								local restored_respawn_unit = _resolve_respawn_unit(pl_data.respawn_unit_data)
+								data.respawn_unit = restored_respawn_unit
+
+								if pl_data.respawn_state == "ready_for_respawn" or pl_data.respawn_state == "respawn" or restored_respawn_unit ~= nil then
 									data.ready_for_respawn = true
 									data.respawn_timer = nil
 								else

@@ -19,3 +19,65 @@
 玩家技能 CD 沒回到快照點，而是一直在計算
 敵人剩餘 HP 沒回到快照點，而是一直在計算
 刷潮 沒回到快照點，而是一直在計算
+
+
+twitch 模式的投票計時沒暫停到
+
+
+
+
+1.在ui加上可開關自動快照的checkbox，以防時間到時自動快照到不想要的場景。
+2.Vermintide 2 的死亡玩家未必已經有一個固定的 respawn position，可能仍在等待重生，重生位置會依照當時隊伍/前方玩家的位置重新決定
+流程應為:
+Snapshot
+   │
+   ├── Dead
+   ├── Respawn timer
+   ├── Respawn state
+   └── 已決定的 respawn position（如果有）
+             │
+             ▼
+        Restore
+             │
+             ├── 還沒到時間
+             │      ↓
+             │   繼續等待
+             │
+             └── 到時間
+                    ↓
+              VT2 原生找 spawn point
+                    ↓
+                 Respawn
+				 
+
+
+
+「已經選定的 Respawn Unit」沒有被還原
+				 
+Restore 後不是「繼續崩潰前的刷潮狀態」，而是：
+清掉原本刷潮 → 保留敵人 Snapshot → 重新讓 Conflict Director 開始跑。
+這會造成刷潮時間、當前 Horde、Pacing 狀態都與崩潰前不同，這樣不對。
+
+
+請修改 Pause mod 的 snapshot_manager.lua，重點修復「刷潮（Horde）無法完整恢復」問題。
+
+要求：
+1. Snapshot 時保存 horde_spawner.hordes 中目前未完成的 Horde 狀態。
+2. 參考原始 horde_spawner.lua 的結構，至少保存：
+   - horde_type
+   - spawned / num_to_spawn
+   - start_time 的剩餘時間
+   - horde_spawns：num_to_spawn、spawn_list、hidden、done、all_done_spawned_time 剩餘時間
+   - cover_spawns：num_to_spawn、spawn_list、next_spawn_time 剩餘時間
+   - group_id、side_id、silent 等必要欄位
+   - event horde 的 end_time 剩餘時間、terror_event_ids 等必要狀態
+3. 不要直接保存 Unit userdata；請使用可恢復的 level object ID，並找出 VT2 現有的反向解析方法。
+4. Restore 時用「新的 game time + 剩餘時間」重建時間欄位。
+5. 不要再直接：
+   conflict.horde_spawner.hordes = {}
+   也不要把 Horde 狀態全部重置成全新刷潮。
+6. 保持目前玩家、敵人、Mission、Pickup、Scoreboard 等恢復功能不變。
+7. 先閱讀目前 snapshot_manager.lua 和原始 horde_spawner.lua，再修改。
+8. 修改完成後檢查 Lua 語法及所有欄位名稱，避免憑空猜 API。
+
+不要只做近似恢復；優先做到「快照當下刷潮進度 → Restore 後繼續原本進度」。
