@@ -81,3 +81,409 @@ Restore 後不是「繼續崩潰前的刷潮狀態」，而是：
 8. 修改完成後檢查 Lua 語法及所有欄位名稱，避免憑空猜 API。
 
 不要只做近似恢復；優先做到「快照當下刷潮進度 → Restore 後繼續原本進度」。
+
+
+
+
+
+
+
+
+
+
+
+
+
+寫一個PVP mod，盡量套用原本的遊戲機制來實現:
+傷害採取天劫友軍傷害的計算方式(原本的遊戲機制)，使刀劍能對其他玩家造成傷害。
+玩家之間能格擋對方的攻擊(原本的遊戲機制)，格擋會掉體力(原本的遊戲機制)，輕擊掉的體力以原本遊戲中小怪的輕擊計算(原本的遊戲機制)，單手武器的重擊掉的體力以原本遊戲中風暴鼠的輕擊計算(原本的遊戲機制)，雙手武器的重擊掉的體力以原本遊戲中風暴鼠的重擊計算(原本的遊戲機制)。完美格擋不耗格擋值(原本的遊戲機制，屬於武器的金色天賦)。
+武器原本有有效格擋角度(原本的遊戲機制)，有效格擋角度之外的攻擊，直接計算命中(並非原本的遊戲機制，需改動)。
+完美格擋/推擊會使對方玩家踉蹌且無法防禦(並非原本的遊戲機制，需改動，踉蹌為原本的遊戲機制，對應原本遊戲被菁英怪物推擊)
+完美格擋的踉蹌持續3秒，推擊的踉蹌持續一秒，連續推擊持續不疊加，上限一秒(並非原本的遊戲機制，需改動)。
+兩人都輕/重攻擊且武器的體積在空中碰撞會卡刀，(卡刀對應原本遊戲中揮刀砍到披甲敵人時的動作，玩家雙方都不掉血)，(武器碰撞並非原本的遊戲機制，需改動)。
+兩人一個輕攻擊另一人重攻擊且武器的體積在空中碰撞，輕攻擊的玩家會卡刀，重攻擊的玩家則不會(武器碰撞並非原本的遊戲機制，需改動)。
+重攻擊的續力階段能被輕攻擊打斷，揮舞階段則不能被打斷(攻擊階段為原本的遊戲機制，續力階段對應原本遊戲重擊時能被格擋取消的階段，揮舞階段則是不能取消的階段)
+禁用爆擊
+禁用機制秒殺天賦
+所有buff天賦改為只對自己生效
+
+
+
+# Vermintide 2 PVP Mod 實作計畫
+
+## 概述
+
+本計畫旨在為《鼠疫2》建立一個 PVP Mod，盡量複用原本遊戲的現有機制，並在必要時以 Hook 的方式擴展功能。Mod 將放置於 `d:\frank\gemini\PVP\` 目錄下。
+
+---
+
+## 技術背景分析
+
+以下是從原始碼中提取的關鍵機制：
+
+### 傷害系統
+- **友軍傷害**：位於 `scripts/helpers/damage_utils.lua`，函數 `do_damage_calculation()`（L119）。當 `is_friendly_fire = true` 時，傷害乘以 `friendly_fire_multiplier`。
+- **近戰命中判斷**：`action_sweep.lua` 第 889 行：`local is_friendly_fire = not enemy_units_lookup[hit_unit]`，第 897 行直接以 `not is_friendly_fire` 跳過友軍傷害。**我們需要 Hook 此處讓玩家之間可以互相傷害。**
+- **`DamageUtils.allow_friendly_fire_melee()`**（L2923）：`difficulty_settings.friendly_fire_melee` 控制近戰友軍傷害。
+
+### 格擋系統
+- **格擋判斷**：`generic_status_extension.lua`，`can_block()` 函數（L550-604）：計算攻擊者方向與玩家朝向之夾角，對比武器的 `block_angle`，決定是否可格擋。
+- **格擋消耗**：`add_fatigue_points()` 函數（L772）。`blocked_attack = 1`、`blocked_sv_sweep = 4`、`blocked_sv_cleave = 16`（`player_unit_status_settings.lua`）。
+- **完美格擋**：`action_block.lua` L45 設置 `timed_block = t + 0.5`；`action_melee_start.lua` L65 同樣設置（蓄力時）。命中時在 `blocked_attack()` 函數（L624）判斷 `is_timed_block`，若是完美格擋則 `fatigue_cost` 透過 `timed_block_cost` buff 乘算（可歸零）。
+
+### 格擋角度
+- **`can_block()` 函數**：`block_angle`（通常 90°）為內圈角，`outer_block_angle`（360°）為外圈角。外圈格擋的 `fatigue_point_costs_multiplier = 2`。
+- **原遊戲角度外不格擋**：原本角度外直接 `return false`，但對 AI 敵人而言不會傷害，因為 `check_melee_block()` 的回傳值判斷整個攻擊流程。對玩家而言，需要讓角度外的攻擊直接命中（原本已是如此，因為 can_block 回傳 false 後不會觸發格擋）。
+
+### 踉蹌 (Stagger/Overpowered)
+- **Overpowered 狀態**：`StatusUtils.set_overpowered_network(unit, true, template_name, attacking_unit)` 觸發，玩家進入 `player_character_state_overpowered.lua` 狀態。
+- **Overpowered 模板**：`PlayerUnitMovementSettings.overpowered_templates` 定義動畫與行為。
+- **推擊踉蹌**：`action_push_stagger.lua` 推擊對敵人生效，但原本跳過友軍（`is_enemy` 判斷在 L186-190）。
+
+### 攻擊階段
+- **`melee_start` 階段（續力/蓄力）**：由 `ActionMeleeStart`（`action_melee_start.lua`）處理，`ActionUtils.is_melee_start_sub_action()` 判斷。可被命中打斷（L1238 的 `uninterruptible_heavy` 邏輯）。
+- **`sweep` 揮舞階段**：`ActionSweep`（`action_sweep.lua`），有 `uninterruptible` 設置時不可打斷。
+- **打斷邏輯**：`player_character_state_helper.lua` L1238：`can_interrupt = (not current_action_settings.uninterruptible and ...)`。
+
+### 武器碰撞（需新增）
+- 原遊戲**不存在玩家之間的武器碰撞**，需完全自訂實作。
+- 思路：在 `action_sweep.lua` 的掃描命中時，若目標也在攻擊中，則觸發「卡刀」效果，而非傷害。
+
+---
+
+## 開放問題
+
+> [!IMPORTANT]
+> **Mod 框架**：此 Mod 採用哪個 Mod 框架？Vermintide Mod Framework (VMF) 是標準選項，需確認是否使用。計畫假設使用 VMF 的 `mod:hook()` 機制。
+
+> [!IMPORTANT]
+> **天劫難度的友軍傷害乘數**：「天劫難度的友軍傷害計算方式」指的是 Cataclysm 難度的 `friendly_fire_multiplier`。實際數值需從難度設定表確認，或使用固定值（如 0.5）。請確認要使用哪個難度的友軍傷害乘數，或設定一個固定的 PVP 傷害比例。
+
+> [!IMPORTANT]
+> **雙手武器判斷標準**：「雙手武器的重擊」如何判斷？是根據武器模板的某個欄位（如 `two_handed`），還是根據武器分類（如 2h_sword、greatsword 等）？
+
+> [!NOTE]
+> **網路同步**：PVP 傷害的網路同步是否需要特別處理？原遊戲有完整的 RPC 機制，Hook 後應可複用。
+
+---
+
+## 修改計畫
+
+### 系統 1：PVP 傷害核心（近戰攻擊命中友軍）
+
+#### [MODIFY] `action_sweep.lua` → Hook `_do_overlap`
+- 在計算命中目標時（L897），移除 `not is_friendly_fire` 的限制。
+- 對友軍玩家目標：改以 `is_friendly_fire = true` 方式走正常傷害流程，讓 `do_damage_calculation` 套用友軍傷害乘數。
+- 同時呼叫 `DamageUtils.check_melee_block()` 判斷格擋。
+
+#### [MODIFY] `action_push_stagger.lua` → Hook 推擊邏輯
+- 在 L186-190 中，移除 `is_enemy` 限制，讓推擊可以作用於其他玩家。
+- 推擊後對目標玩家觸發 1 秒踉蹌（`set_overpowered_network`）。
+
+---
+
+### 系統 2：格擋互動
+
+#### 原本機制（直接複用）
+- `can_block()` → 格擋角度判斷（已有效）
+- `blocked_attack()` → 消耗體力
+- `add_fatigue_points()` → 計算體力消耗
+
+#### PVP 格擋體力消耗對應
+| 攻擊類型 | 對應的 fatigue_type | 原本數值 |
+|---------|-------------------|--------|
+| 玩家輕擊 | `blocked_attack` | 1 點 |
+| 單手武器重擊 | `blocked_sv_sweep` | 4 點 |
+| 雙手武器重擊 | `blocked_sv_cleave` | 16 點 |
+
+**完美格擋**（原 `timed_block_cost` 天賦）：完全複用，無需修改。
+
+---
+
+### 系統 3：完美格擋/推擊踉蹌（新增）
+
+#### [NEW] `pvp_stagger.lua`
+- 當 `is_timed_block = true` 時（完美格擋），對攻擊者觸發 3 秒踉蹌。
+- 當推擊命中玩家時，觸發 1 秒踉蹌。
+- 踉蹌使用 `StatusUtils.set_overpowered_network()`。
+- **防疊加**：連續推擊踉蹌時間若仍有效，不延長（最多 1 秒）。
+- 踉蹌期間玩家無法進行格擋（因為 `overpowered` 狀態會停止武器動作）。
+
+**所需 Overpowered 模板**（新增）：
+```lua
+-- 3 秒完美格擋踉蹌
+pvp_parry_stagger = { duration = 3, ... }
+-- 1 秒推擊踉蹌  
+pvp_push_stagger = { duration = 1, ... }
+```
+
+---
+
+### 系統 4：武器碰撞卡刀（新增）
+
+#### [NEW] `pvp_weapon_clash.lua`
+實作邏輯：在 `action_sweep.lua` 的命中處理中，在確認傷害之前，額外檢查目標玩家是否也正在進行攻擊（`current_action_settings.kind == "sweep"` 或 `melee_start`）：
+
+| 攻擊者 | 被攻擊者 | 結果 |
+|-------|---------|------|
+| 輕/重攻擊 | 也在輕/重攻擊（weapons 碰撞） | **雙方卡刀**（播放命中裝甲動畫，雙方均不扣血） |
+| 重攻擊 | 在輕攻擊（碰撞） | 輕攻擊方卡刀，重攻擊方**不卡** |
+| 輕攻擊 | 在重攻擊（碰撞） | 輕攻擊方卡刀，重攻擊方不卡 |
+| 任意攻擊 | 未攻擊（格擋或空手） | 正常進入格擋/傷害判斷 |
+
+「卡刀」效果對應撞到裝甲時的 `hit_stop` 動畫（`play_hit_animations` with `armor_type = 2`）。
+
+---
+
+### 系統 5：蓄力階段可被輕擊打斷
+
+#### 原本機制分析
+`player_character_state_helper.lua` L1238 中：
+```lua
+uninterruptible_heavy = ActionUtils.is_melee_start_sub_action(current_action_settings) and buff_extension:has_buff_perk("uninterruptible_heavy")
+```
+- `melee_start` 階段（續力）：若沒有 `uninterruptible_heavy` 天賦，**已可被打斷**。
+- `sweep` 階段（揮舞）：動作有 `uninterruptible = true` 時不可打斷。
+
+因此，**蓄力階段可被打斷**這個需求，在大多數情況下已由原本機制支援，只要傷害能正常觸發 `hitreact_interrupt()`。
+
+**需要確認**：PVP 傷害是否會正確觸發 `recently_damaged()` 與 `hitreact_interrupt()`，若有需要則 Hook 。
+
+---
+
+## 檔案結構
+
+```
+d:\frank\gemini\PVP\
+├── mod.json                    # Mod 描述
+├── scripts\
+│   └── mods\
+│       └── pvp_mod\
+│           ├── pvp_mod.lua            # 主 Mod 入口，Hook 掛載
+│           ├── pvp_damage.lua         # 系統1: PVP 傷害核心
+│           ├── pvp_stagger.lua        # 系統3: 踉蹌管理
+│           ├── pvp_weapon_clash.lua   # 系統4: 武器碰撞
+│           └── pvp_settings.lua       # 設定（傷害乘數等）
+```
+
+---
+
+## 驗證計畫
+
+### 自動驗證
+- Lua 語法檢查（`luac` 或 Mod 框架載入測試）
+
+### 手動驗證
+1. 啟動遊戲，載入 Mod
+2. 與另一玩家（或 Bot）測試近戰攻擊是否造成傷害
+3. 測試格擋是否消耗正確的體力點數
+4. 測試完美格擋（格擋開始後 0.5 秒內）是否觸發踉蹌
+5. 測試推擊是否使對方踉蹌 1 秒
+6. 測試雙方同時攻擊時的卡刀判斷
+7. 測試蓄力階段被輕擊打斷
+# Vermintide 2 PVP Mod 實作計畫
+
+## 概述
+
+本計畫旨在為《鼠疫2》建立一個 PVP Mod，盡量複用原本遊戲的現有機制，並在必要時以 Hook 的方式擴展功能。Mod 將放置於 `d:\frank\gemini\PVP\` 目錄下。
+
+---
+
+## 技術背景分析
+
+以下是從原始碼中提取的關鍵機制：
+
+### 傷害系統
+- **友軍傷害**：位於 `scripts/helpers/damage_utils.lua`，函數 `do_damage_calculation()`（L119）。當 `is_friendly_fire = true` 時，傷害乘以 `friendly_fire_multiplier`。
+- **近戰命中判斷**：`action_sweep.lua` 第 889 行：`local is_friendly_fire = not enemy_units_lookup[hit_unit]`，第 897 行直接以 `not is_friendly_fire` 跳過友軍傷害。**我們需要 Hook 此處讓玩家之間可以互相傷害。**
+- **`DamageUtils.allow_friendly_fire_melee()`**（L2923）：`difficulty_settings.friendly_fire_melee` 控制近戰友軍傷害。
+
+### 格擋系統
+- **格擋判斷**：`generic_status_extension.lua`，`can_block()` 函數（L550-604）：計算攻擊者方向與玩家朝向之夾角，對比武器的 `block_angle`，決定是否可格擋。
+- **格擋消耗**：`add_fatigue_points()` 函數（L772）。`blocked_attack = 1`、`blocked_sv_sweep = 4`、`blocked_sv_cleave = 16`（`player_unit_status_settings.lua`）。
+- **完美格擋**：`action_block.lua` L45 設置 `timed_block = t + 0.5`；`action_melee_start.lua` L65 同樣設置（蓄力時）。命中時在 `blocked_attack()` 函數（L624）判斷 `is_timed_block`，若是完美格擋則 `fatigue_cost` 透過 `timed_block_cost` buff 乘算（可歸零）。
+
+### 格擋角度
+- **`can_block()` 函數**：`block_angle`（通常 90°）為內圈角，`outer_block_angle`（360°）為外圈角。外圈格擋的 `fatigue_point_costs_multiplier = 2`。
+- **原遊戲角度外不格擋**：原本角度外直接 `return false`，但對 AI 敵人而言不會傷害，因為 `check_melee_block()` 的回傳值判斷整個攻擊流程。對玩家而言，需要讓角度外的攻擊直接命中（原本已是如此，因為 can_block 回傳 false 後不會觸發格擋）。
+
+### 踉蹌 (Stagger/Overpowered)
+- **Overpowered 狀態**：`StatusUtils.set_overpowered_network(unit, true, template_name, attacking_unit)` 觸發，玩家進入 `player_character_state_overpowered.lua` 狀態。
+- **Overpowered 模板**：`PlayerUnitMovementSettings.overpowered_templates` 定義動畫與行為。
+- **推擊踉蹌**：`action_push_stagger.lua` 推擊對敵人生效，但原本跳過友軍（`is_enemy` 判斷在 L186-190）。
+
+### 攻擊階段
+- **`melee_start` 階段（續力/蓄力）**：由 `ActionMeleeStart`（`action_melee_start.lua`）處理，`ActionUtils.is_melee_start_sub_action()` 判斷。可被命中打斷（L1238 的 `uninterruptible_heavy` 邏輯）。
+- **`sweep` 揮舞階段**：`ActionSweep`（`action_sweep.lua`），有 `uninterruptible` 設置時不可打斷。
+- **打斷邏輯**：`player_character_state_helper.lua` L1238：`can_interrupt = (not current_action_settings.uninterruptible and ...)`。
+
+### 武器碰撞（需新增）
+- 原遊戲**不存在玩家之間的武器碰撞**，需完全自訂實作。
+- 思路：在 `action_sweep.lua` 的掃描命中時，若目標也在攻擊中，則觸發「卡刀」效果，而非傷害。
+
+---
+
+## 開放問題
+
+> [!IMPORTANT]
+> **Mod 框架**：此 Mod 採用哪個 Mod 框架？Vermintide Mod Framework (VMF) 是標準選項，需確認是否使用。計畫假設使用 VMF 的 `mod:hook()` 機制。
+
+> [!IMPORTANT]
+> **天劫難度的友軍傷害乘數**：「天劫難度的友軍傷害計算方式」指的是 Cataclysm 難度的 `friendly_fire_multiplier`。實際數值需從難度設定表確認，或使用固定值（如 0.5）。請確認要使用哪個難度的友軍傷害乘數，或設定一個固定的 PVP 傷害比例。
+
+> [!IMPORTANT]
+> **雙手武器判斷標準**：「雙手武器的重擊」如何判斷？是根據武器模板的某個欄位（如 `two_handed`），還是根據武器分類（如 2h_sword、greatsword 等）？
+
+> [!NOTE]
+> **網路同步**：PVP 傷害的網路同步是否需要特別處理？原遊戲有完整的 RPC 機制，Hook 後應可複用。
+
+---
+
+## 修改計畫
+
+### 系統 1：PVP 傷害核心（近戰攻擊命中友軍）
+
+#### [MODIFY] `action_sweep.lua` → Hook `_do_overlap`
+- 在計算命中目標時（L897），移除 `not is_friendly_fire` 的限制。
+- 對友軍玩家目標：改以 `is_friendly_fire = true` 方式走正常傷害流程，讓 `do_damage_calculation` 套用友軍傷害乘數。
+- 同時呼叫 `DamageUtils.check_melee_block()` 判斷格擋。
+
+#### [MODIFY] `action_push_stagger.lua` → Hook 推擊邏輯
+- 在 L186-190 中，移除 `is_enemy` 限制，讓推擊可以作用於其他玩家。
+- 推擊後對目標玩家觸發 1 秒踉蹌（`set_overpowered_network`）。
+
+---
+
+### 系統 2：格擋互動
+
+#### 原本機制（直接複用）
+- `can_block()` → 格擋角度判斷（已有效）
+- `blocked_attack()` → 消耗體力
+- `add_fatigue_points()` → 計算體力消耗
+
+#### PVP 格擋體力消耗對應
+| 攻擊類型 | 對應的 fatigue_type | 原本數值 |
+|---------|-------------------|--------|
+| 玩家輕擊 | `blocked_attack` | 1 點 |
+| 單手武器重擊 | `blocked_sv_sweep` | 4 點 |
+| 雙手武器重擊 | `blocked_sv_cleave` | 16 點 |
+
+**完美格擋**（原 `timed_block_cost` 天賦）：完全複用，無需修改。
+
+---
+
+### 系統 3：完美格擋/推擊踉蹌（新增）
+
+#### [NEW] `pvp_stagger.lua`
+- 當 `is_timed_block = true` 時（完美格擋），對攻擊者觸發 3 秒踉蹌。
+- 當推擊命中玩家時，觸發 1 秒踉蹌。
+- 踉蹌使用 `StatusUtils.set_overpowered_network()`。
+- **防疊加**：連續推擊踉蹌時間若仍有效，不延長（最多 1 秒）。
+- 踉蹌期間玩家無法進行格擋（因為 `overpowered` 狀態會停止武器動作）。
+
+**所需 Overpowered 模板**（新增）：
+```lua
+-- 3 秒完美格擋踉蹌
+pvp_parry_stagger = { duration = 3, ... }
+-- 1 秒推擊踉蹌  
+pvp_push_stagger = { duration = 1, ... }
+```
+
+---
+
+### 系統 4：武器碰撞卡刀（新增）
+
+#### [NEW] `pvp_weapon_clash.lua`
+實作邏輯：在 `action_sweep.lua` 的命中處理中，在確認傷害之前，額外檢查目標玩家是否也正在進行攻擊（`current_action_settings.kind == "sweep"` 或 `melee_start`）：
+
+| 攻擊者 | 被攻擊者 | 結果 |
+|-------|---------|------|
+| 輕/重攻擊 | 也在輕/重攻擊（weapons 碰撞） | **雙方卡刀**（播放命中裝甲動畫，雙方均不扣血） |
+| 重攻擊 | 在輕攻擊（碰撞） | 輕攻擊方卡刀，重攻擊方**不卡** |
+| 輕攻擊 | 在重攻擊（碰撞） | 輕攻擊方卡刀，重攻擊方不卡 |
+| 任意攻擊 | 未攻擊（格擋或空手） | 正常進入格擋/傷害判斷 |
+
+「卡刀」效果對應撞到裝甲時的 `hit_stop` 動畫（`play_hit_animations` with `armor_type = 2`）。
+
+---
+
+### 系統 5：蓄力階段可被輕擊打斷
+
+#### 原本機制分析
+`player_character_state_helper.lua` L1238 中：
+```lua
+uninterruptible_heavy = ActionUtils.is_melee_start_sub_action(current_action_settings) and buff_extension:has_buff_perk("uninterruptible_heavy")
+```
+- `melee_start` 階段（續力）：若沒有 `uninterruptible_heavy` 天賦，**已可被打斷**。
+- `sweep` 階段（揮舞）：動作有 `uninterruptible = true` 時不可打斷。
+
+因此，**蓄力階段可被打斷**這個需求，在大多數情況下已由原本機制支援，只要傷害能正常觸發 `hitreact_interrupt()`。
+
+**需要確認**：PVP 傷害是否會正確觸發 `recently_damaged()` 與 `hitreact_interrupt()`，若有需要則 Hook 。
+
+---
+
+## 檔案結構
+
+```
+d:\frank\gemini\PVP\
+├── mod.json                    # Mod 描述
+├── scripts\
+│   └── mods\
+│       └── pvp_mod\
+│           ├── pvp_mod.lua            # 主 Mod 入口，Hook 掛載
+│           ├── pvp_damage.lua         # 系統1: PVP 傷害核心
+│           ├── pvp_stagger.lua        # 系統3: 踉蹌管理
+│           ├── pvp_weapon_clash.lua   # 系統4: 武器碰撞
+│           └── pvp_settings.lua       # 設定（傷害乘數等）
+```
+
+---
+
+## 驗證計畫
+
+### 自動驗證
+- Lua 語法檢查（`luac` 或 Mod 框架載入測試）
+
+### 手動驗證
+1. 啟動遊戲，載入 Mod
+2. 與另一玩家（或 Bot）測試近戰攻擊是否造成傷害
+3. 測試格擋是否消耗正確的體力點數
+4. 測試完美格擋（格擋開始後 0.5 秒內）是否觸發踉蹌
+5. 測試推擊是否使對方踉蹌 1 秒
+6. 測試雙方同時攻擊時的卡刀判斷
+7. 測試蓄力階段被輕擊打斷
+
+
+
+
+
+
+Open Questions / 已確認規格
+1. PVP 傷害倍率
+PVP 玩家 → 玩家使用獨立的 PVP Damage 倍率。
+不直接使用遊戲原生 friendly_fire_multiplier。
+可調整範圍：1%～200%。
+預設值：25%。
+25% 只是預設 PVP 傷害倍率，不是把 PVP 當成友傷處理。
+
+UI：
+
+PVP Damage    [────●──────────────] 25%
+              1%                200%
+拖動 Slider 後即時生效。
+
+
+2. 單手／雙手武器判定
+VT2 原生 Slayer 天賦已確認使用：
+inventory_extension:get_item_template(slot_data)
+取得 weapon template，再讀取：
+weapon_template.buff_type
+分類：
+MELEE_1H → 單手
+MELEE_2H → 雙手
+因此 PVP：
+不建立武器名稱白名單。
+不自行猜測其他武器欄位。
+所有 PVP 的單手／雙手判定統一使用這套原生 weapon_template.buff_type 邏輯。
+下一步只需要確認目前攻擊 action 如何取得對應的 weapon template。
