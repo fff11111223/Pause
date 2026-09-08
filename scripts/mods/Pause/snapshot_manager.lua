@@ -238,6 +238,7 @@ function SnapshotManager:init()
 	self._pause_after_restore_countdown = nil
 	self._inventory_updates_after_restore_pause = nil
 	self._pending_player_equipment_restores = {}
+	self._pending_enemy_restores = {}
 end
 
 --- Collect complete level, flow, player, enemy, and scoreboard state
@@ -1555,94 +1556,32 @@ function SnapshotManager:apply_snapshot(snapshot)
 						force_boss_health_ui = is_boss and true or false,
 					}
 
-					local spawned_unit = nil
-					-- 1. Only spawn immediately after the breed package has reached every
-					-- peer.  Immediate spawning bypasses ConflictDirector's package
-					-- readiness check and can construct an AI rig without its a_sword /
-					-- weapon attachment nodes.
-					local breed_ready = package_loader and package_loader.is_breed_loaded_on_all_peers
-						and package_loader:is_breed_loaded_on_all_peers(breed.name)
-					if breed_ready and conflict.spawn_unit_immediate then
+					-- Always use the director's normal queue.  Immediate spawning in the
+					-- same restore frame as destroy_all_units() can re-enter native entity
+					-- and network setup before the destroyed AI has been cleaned up.
+					if conflict.spawn_queued_unit then
 						pcall(function()
-							spawned_unit = conflict:spawn_unit_immediate(breed, pos, rot, "snapshot", nil, "snapshot", optional_data)
-						end)
-					end
-
-					-- 2. If immediate spawn succeeded, apply health and boss UI directly
-					if spawned_unit and Unit.alive(spawned_unit) then
-						if damage_taken > 0 then
-							local h_ext = ScriptUnit.has_extension(spawned_unit, "health_system") and ScriptUnit.extension(spawned_unit, "health_system")
-							if h_ext and h_ext.set_server_damage_taken then
-								local max_hp = h_ext:get_max_health()
-								local safe_damage = math.min(damage_taken, max_hp - 1)
-								if safe_damage > 0 then
-									h_ext:set_server_damage_taken(safe_damage)
-								end
-							end
-						end
-
-						if is_boss then
-							pcall(function()
-								Managers.state.event:trigger("force_add_boss_health_ui", spawned_unit)
-								Managers.state.event:trigger("boss_health_bar_register_unit", spawned_unit, "forced")
-							end)
-						end
-					else
-						-- 3. Fallback: Queue spawn
-						if conflict.spawn_queued_unit then
-							pcall(function()
-								local pos_box = Vector3Box(pos)
-								local rot_box = QuaternionBox(rot)
-								local unit_data = {}
-								conflict:spawn_queued_unit(breed, pos_box, rot_box, "snapshot", nil, "snapshot", optional_data, nil, unit_data)
-								table.insert(queued_spawns, {
-									unit_data = unit_data,
-									damage_taken = damage_taken,
-									is_boss = is_boss,
-								})
-							end)
-						end
-					end
-				end
-			end
-
-			-- Repeatedly process spawn queue until all queued enemies are instantiated
-			if conflict.update_spawn_queue and #queued_spawns > 0 then
-				local max_iterations = 200
-				local iterations = 0
-				while conflict.spawn_queue_size and conflict.spawn_queue_size > 0 and iterations < max_iterations do
-					iterations = iterations + 1
-					conflict:update_spawn_queue(current_t)
-				end
-			end
-
-			-- Restore remaining HP and Boss UI for queued spawns
-			for _, spawn_info in ipairs(queued_spawns) do
-				local enemy_unit = spawn_info.unit_data and spawn_info.unit_data[1]
-				local damage_taken = spawn_info.damage_taken
-				if enemy_unit and Unit.alive(enemy_unit) then
-					if damage_taken > 0 then
-						local h_ext = ScriptUnit.has_extension(enemy_unit, "health_system") and ScriptUnit.extension(enemy_unit, "health_system")
-						if h_ext and h_ext.set_server_damage_taken then
-							local max_hp = h_ext:get_max_health()
-							local safe_damage = math.min(damage_taken, max_hp - 1)
-							if safe_damage > 0 then
-								h_ext:set_server_damage_taken(safe_damage)
-							end
-						end
-					end
-
-					if spawn_info.is_boss then
-						pcall(function()
-							Managers.state.event:trigger("force_add_boss_health_ui", enemy_unit)
-							Managers.state.event:trigger("boss_health_bar_register_unit", enemy_unit, "forced")
+							local pos_box = Vector3Box(pos)
+							local rot_box = QuaternionBox(rot)
+							local unit_data = {}
+							conflict:spawn_queued_unit(breed, pos_box, rot_box, "snapshot", nil, "snapshot", optional_data, nil, unit_data)
+							table.insert(queued_spawns, {
+								unit_data = unit_data,
+								damage_taken = damage_taken,
+								is_boss = is_boss,
+							})
 						end)
 					end
 				end
 			end
 
-			-- Allow ConflictDirector:update to run for 5 frames to settle physics and navmesh
-			mod._allow_director_updates = 5
+			-- Apply health and boss UI only after the director has completed normal
+			-- queued spawning and NetworkUnitStorage has assigned each unit an ID.
+			self._pending_enemy_restores = queued_spawns
+
+			-- Give the normal queue enough frames to finish without re-entering it
+			-- manually from the restore call stack.
+			mod._allow_director_updates = math.max(60, #queued_spawns * 2)
 		end
 	end)
 	if not en_ok then
@@ -2125,6 +2064,39 @@ function SnapshotManager:update(dt)
 						-- units are linked; retry after a small settling window.
 						entry.wait_frames = 2
 					end
+				end
+			end
+		end
+	end
+
+	-- A queued enemy becomes safe to touch only after the director has spawned
+	-- it and NetworkUnitStorage has registered its game object.  Applying saved
+	-- health earlier was the remaining route into stale native game-object data.
+	local pending_enemies = self._pending_enemy_restores
+	if pending_enemies and #pending_enemies > 0 then
+		for i = #pending_enemies, 1, -1 do
+			local entry = pending_enemies[i]
+			local enemy_unit = entry.unit_data and entry.unit_data[1]
+			if enemy_unit and Unit.alive(enemy_unit) and _game_object_id_if_ready(enemy_unit) then
+				local restored = pcall(function()
+					if entry.damage_taken > 0 then
+						local health_ext = ScriptUnit.has_extension(enemy_unit, "health_system") and ScriptUnit.extension(enemy_unit, "health_system")
+						if health_ext and health_ext.set_server_damage_taken then
+							local max_hp = health_ext:get_max_health()
+							local safe_damage = math.min(entry.damage_taken, max_hp - 1)
+							if safe_damage > 0 then
+								health_ext:set_server_damage_taken(safe_damage)
+							end
+						end
+					end
+
+					if entry.is_boss then
+						Managers.state.event:trigger("force_add_boss_health_ui", enemy_unit)
+						Managers.state.event:trigger("boss_health_bar_register_unit", enemy_unit, "forced")
+					end
+				end)
+				if restored then
+					table.remove(pending_enemies, i)
 				end
 			end
 		end

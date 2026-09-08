@@ -411,6 +411,106 @@ mod._allow_director_updates = 0
 -- Allows a few inventory updates after a snapshot restore has re-paused.  This
 -- completes weapon attachment setup without resuming gameplay.
 mod._allow_inventory_updates = 0
+
+-- Networked animation helpers assert if a newly spawned unit has not yet been
+-- inserted into NetworkUnitStorage.  Keep the local animation, but suppress
+-- only the impossible RPC during that initialization frame.  Once registered,
+-- the normal VT2 sync path is used unchanged.
+local function _has_registered_game_object(unit)
+	local unit_storage = Managers.state and Managers.state.unit_storage
+	return unit_storage and unit_storage.bimap_goid_unit and unit_storage.bimap_goid_unit[unit] ~= nil
+end
+
+-- During snapshot replacement a reference can outlive the corresponding
+-- NetworkUnitStorage entry for one frame.  The engine GameSession bindings
+-- require a numeric id and otherwise abort the entire script update.  Guard
+-- both reads and writes globally so every game-object field access made during
+-- that transient state behaves as an unavailable field instead of crashing.
+-- This includes ActionSweep's cleave calculation, which reads bt_action_name
+-- from an enemy that may just have been removed by destroy_all_units().
+if GameSession and not GameSession._pause_safe_game_object_fields then
+	local original_game_object_field = GameSession.game_object_field
+	local original_set_game_object_field = GameSession.set_game_object_field
+
+	GameSession.game_object_field = function(game, game_object_id, field_name)
+		if not game or type(game_object_id) ~= "number" then
+			return nil
+		end
+		return original_game_object_field(game, game_object_id, field_name)
+	end
+
+	GameSession.set_game_object_field = function(game, game_object_id, field_name, value)
+		if not game or type(game_object_id) ~= "number" then
+			return nil
+		end
+		return original_set_game_object_field(game, game_object_id, field_name, value)
+	end
+
+	GameSession._pause_safe_game_object_fields = true
+end
+
+if rawget(_G, "AnimationSystem") then
+	mod:hook(AnimationSystem, "anim_event", function(func, self, unit, event_name, skip_sync)
+		if not skip_sync and not _has_registered_game_object(unit) then
+			return func(self, unit, event_name, true)
+		end
+		return func(self, unit, event_name, skip_sync)
+	end)
+
+	mod:hook(AnimationSystem, "anim_event_with_variable_float", function(func, self, unit, event_name, variable_name, variable_value, skip_sync)
+		if not skip_sync and not _has_registered_game_object(unit) then
+			return func(self, unit, event_name, variable_name, variable_value, true)
+		end
+		return func(self, unit, event_name, variable_name, variable_value, skip_sync)
+	end)
+end
+
+if rawget(_G, "GameNetworkManager") then
+	mod:hook(GameNetworkManager, "anim_set_variable_float", function(func, self, unit, variable_name, variable_value)
+		if not _has_registered_game_object(unit) then
+			local variable_index = Unit.animation_find_variable(unit, variable_name)
+			Unit.animation_set_variable(unit, variable_index, variable_value)
+			return
+		end
+		return func(self, unit, variable_name, variable_value)
+	end)
+end
+
+-- `ConflictDirector:destroy_all_units()` removes a unit's game object before
+-- AISystem's bookkeeping has necessarily removed the same unit from
+-- `ai_units_alive`.  Snapshot restoration deliberately performs that bulk
+-- replacement, so the stock implementation can attempt to write AI fields to
+-- a nil game-object id during this short transition.  Reimplement only this
+-- network-sync loop with a registration check; AI behavior and cleanup remain
+-- owned by the original systems.
+if rawget(_G, "AISystem") then
+	mod:hook(AISystem, "update_game_objects", function(_, self)
+		local network_manager = Managers.state and Managers.state.network
+		local game = network_manager and network_manager:game()
+		local unit_storage = Managers.state and Managers.state.unit_storage
+		local go_ids = unit_storage and unit_storage.bimap_goid_unit
+		if not game or not go_ids then
+			return
+		end
+
+		local action_names = NetworkLookup and NetworkLookup.bt_action_names
+		for unit, extension in pairs(self.ai_units_alive) do
+			local game_object_id = go_ids[unit]
+			if game_object_id then
+				local action_name = extension:current_action_name()
+				local action_id = action_names and action_names[action_name]
+				if action_id then
+					GameSession.set_game_object_field(game, game_object_id, "bt_action_name", action_id)
+				end
+
+				local blackboard = BLACKBOARDS[unit]
+				local target_unit_id = blackboard and go_ids[blackboard.target_unit]
+				GameSession.set_game_object_field(game, game_object_id, "target_unit_id", target_unit_id or NetworkConstants.invalid_game_object_id)
+			end
+		end
+	end)
+end
+
 mod:hook(ConflictDirector, "update", function(func, self, dt, t)
 	if mod.is_paused then
 		if mod._allow_director_updates and mod._allow_director_updates > 0 then
