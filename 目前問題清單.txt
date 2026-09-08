@@ -488,5 +488,38 @@ MELEE_2H → 雙手
 所有 PVP 的單手／雙手判定統一使用這套原生 weapon_template.buff_type 邏輯。
 下一步只需要確認目前攻擊 action 如何取得對應的 weapon template。
 
-[Script Error]: foundation/scripts/util/error.lua:26: Unit storage does not have a game object id for "[Unit '#ID[d28076aa1c1c64a5]']"
 
+
+
+
+8:29:53.419 <<Lua Error>>scripts/mods/pvp_mod/pvp_stagger.lua:26: attempt to call method 'accumulated_stagger' (a nil value)<</Lua Error>>
+<<crashify-property>>startup = false<</crashify-property>>
+<<crashify-property>>shutdown = false<</crashify-property>>
+<<crashify-property>>editor = false<</crashify-property>>
+<<Callstack>>
+{00007ff689bd0000, 015b8000, 6a104cf7, a2bd7e22-99aa-4fd2-be11-2bd7a135f5c7, 00000001, D:\a\w\vt2-stingray\vt2\release\release_hon_2026_03_25_yearly_events\engine\win64_dx12\release\vermintide2_dx12.pdb}
+{00007ffac8b00000, 00267000, 7e1f2ca9, 3d1fd1a7-1ac4-1595-9067-c2372f53c091, 00000001, ntdll.pdb}
+{00007ffac7470000, 000ca000, 5481efd0, 1bfecef3-ecc2-8347-6a31-e4461a4ad4f6, 00000001, kernel32.pdb}
+
+0x00007ff689bd0000:0x0000000000307a2d 
+0x00007ff689bd0000:0x000000000030884a 
+0x00007ff689bd0000:0x0000000000360437 
+0x00007ff689bd0000:0x00000000000eefa1 
+0x00007ff689bd0000:0x000000000035feb0 
+0x00007ff689bd0000:0x0000000000033fd0 
+0x00007ff689bd0000:0x000000000003368a 
+0x00007ff689bd0000:0x0000000000022a8f 
+0x00007ff689bd0000:0x0000000000023209 
+0x00007ff689bd0000:0x0000000000023639 
+0x00007ff689bd0000:0x000000000053c6cb ffxFsr2ResourceIsNull
+0x00007ffac7470000:0x000000000002ccb7 BaseThreadInitThunk
+0x00007ffac8b00000:0x00000000000acaec RtlUserThreadStart
+<</Callstack>>
+<<Crash version>>1<</Crash version>>
+<<Thread name>>main<</Thread name>>
+<<Platform>>win32<</Platform>>
+<<Build identifier>>50987039cbc11edde2d522b5f22742ee7e94714d<</Build identifier>>
+<<Build type>>release<</Build type>>
+<<Engine build id>>734103<</Engine build id>>
+<<Product version>>Developer Build (1.3.11.13218)<</Product version>>
+<<Session>>003ff454-d6fe-475e-84ec-0553165c08ae<</Session>>
