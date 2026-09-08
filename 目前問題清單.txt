@@ -487,3 +487,6 @@ MELEE_2H → 雙手
 不自行猜測其他武器欄位。
 所有 PVP 的單手／雙手判定統一使用這套原生 weapon_template.buff_type 邏輯。
 下一步只需要確認目前攻擊 action 如何取得對應的 weapon template。
+
+[Script Error]: foundation/scripts/util/error.lua:26: Unit storage does not have a game object id for "[Unit '#ID[d28076aa1c1c64a5]']"
+
