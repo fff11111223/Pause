@@ -100,7 +100,9 @@ local function _restore_player_equipment(pl_unit, pl_data, pl_go_id, is_remote, 
 		for _, slot_name in ipairs({ "slot_healthkit", "slot_potion", "slot_grenade" }) do
 			local desired_item = pl_data.consumables[slot_name]
 			local current_slot_data = inventory_ext:get_slot_data(slot_name)
-			local current_item_key = current_slot_data and current_slot_data.item_data and current_slot_data.item_data.key
+			-- SimpleInventoryExtension.add_equipment and its RPC use item_data.name
+			-- (the ItemMasterList / NetworkLookup key), not backend item_data.key.
+			local current_item_key = current_slot_data and current_slot_data.item_data and current_slot_data.item_data.name
 			local slot_id = NetworkLookup.equipment_slots[slot_name]
 			if current_item_key ~= desired_item then
 				if current_slot_data then
@@ -120,6 +122,68 @@ local function _restore_player_equipment(pl_unit, pl_data, pl_go_id, is_remote, 
 					end
 				end
 			end
+		end
+	end
+
+	return true
+end
+
+-- PlayerUnitHealthExtension stores the authoritative absolute health values in
+-- its health game object.  Its update method consumes the two
+-- `set_*_health_percentage` fields on the next frame, so snapshot restore must
+-- never use those initialization-only fields: they would turn an absolute
+-- snapshot into a percentage of a possibly different post-spawn max health.
+local function _restore_player_runtime_state(pl_unit, pl_data, pl_go_id)
+	if not pl_unit or not Unit.alive(pl_unit) or not pl_go_id then
+		return false
+	end
+
+	local health_ext = ScriptUnit.has_extension(pl_unit, "health_system") and ScriptUnit.extension(pl_unit, "health_system")
+	if health_ext and health_ext.game and health_ext.health_game_object_id then
+		local game = health_ext.game
+		local health_go_id = health_ext.health_game_object_id
+		local native_max_health = GameSession.game_object_field(game, health_go_id, "max_health")
+		if native_max_health and native_max_health > 0 then
+			local permanent = math.clamp(pl_data.current_permanent_health or 0, 0, native_max_health)
+			local temporary = math.clamp(pl_data.current_temporary_health or 0, 0, native_max_health)
+
+			-- Match the native extension's bookkeeping to the already initialized
+			-- max-health value, then write raw networkified absolute values.
+			health_ext.previous_max_health = native_max_health
+			health_ext.set_health_percentage = nil
+			health_ext.set_temporary_health_percentage = nil
+			GameSession.set_game_object_field(game, health_go_id, "current_health", DamageUtils.networkify_health(permanent))
+			GameSession.set_game_object_field(game, health_go_id, "current_temporary_health", DamageUtils.networkify_health(temporary))
+			health_ext.damage = math.max(native_max_health - permanent, 0)
+		end
+	end
+
+	local career_ext = ScriptUnit.has_extension(pl_unit, "career_system") and ScriptUnit.extension(pl_unit, "career_system")
+	if career_ext and career_ext._abilities then
+		local saved_abilities = pl_data.ability_cooldowns
+		for ability_id, ability in ipairs(career_ext._abilities) do
+			local saved = saved_abilities and saved_abilities[ability_id]
+			if ability.cooldowns then
+				if saved and saved.cooldowns then
+					for cooldown_id = 1, #ability.cooldowns do
+						ability.cooldowns[cooldown_id] = math.clamp(saved.cooldowns[cooldown_id] or 0, 0, ability.max_cooldown)
+					end
+				else
+					local cooldown = math.clamp(pl_data.ability_cooldown or 0, 0, ability.max_cooldown)
+					for cooldown_id = 1, #ability.cooldowns do
+						ability.cooldowns[cooldown_id] = cooldown
+					end
+				end
+			end
+		end
+
+		-- CareerExtension._update_game_object_field uses remaining/max, not the
+		-- inverse.  This is what remote husks read in
+		-- current_ability_cooldown_percentage().
+		local cooldown, max_cooldown = career_ext:current_ability_cooldown(1)
+		local game = Managers.state.network and Managers.state.network:game()
+		if game and max_cooldown and max_cooldown > 0 then
+			GameSession.set_game_object_field(game, pl_go_id, "ability_percentage", math.clamp(cooldown / max_cooldown, 0, 1))
 		end
 	end
 
@@ -356,7 +420,7 @@ function SnapshotManager:collect_snapshot()
 				for _, slot_name in ipairs({ "slot_healthkit", "slot_potion", "slot_grenade" }) do
 					local slot_data = inventory_ext:get_slot_data(slot_name)
 					local item_data = slot_data and slot_data.item_data
-					local item_key = item_data and item_data.key
+					local item_key = item_data and item_data.name
 					consumables[slot_name] = item_key
 				end
 			elseif rawget(_G, "SpawningHelper") and inventory_ext then
@@ -437,6 +501,7 @@ function SnapshotManager:collect_snapshot()
 			-- Exact raw Ability Cooldown in seconds
 			local ability_cooldown = 0
 			local max_ability_cooldown = 0
+			local ability_cooldowns = {}
 			if career_ext then
 				max_ability_cooldown = career_ext:get_max_ability_cooldown() or 0
 				if career_ext.current_ability_cooldown then
@@ -448,6 +513,16 @@ function SnapshotManager:collect_snapshot()
 					local cds = career_ext._abilities[1].cooldowns
 					ability_cooldown = cds[#cds] or 0
 					max_ability_cooldown = career_ext._abilities[1].max_cooldown or max_ability_cooldown
+				end
+				if career_ext._abilities then
+					for ability_id, ability in ipairs(career_ext._abilities) do
+						if ability.cooldowns then
+							ability_cooldowns[ability_id] = {
+								cooldowns = table.clone(ability.cooldowns),
+								cooldown_paused = ability.cooldown_paused,
+							}
+						end
+					end
 				end
 			end
 			local ability_cooldown_percentage = (max_ability_cooldown > 0) and (1 - (ability_cooldown / max_ability_cooldown)) or 1
@@ -520,6 +595,7 @@ function SnapshotManager:collect_snapshot()
 				ability_cooldown = ability_cooldown,
 				max_ability_cooldown = max_ability_cooldown,
 				ability_cooldown_percentage = ability_cooldown_percentage,
+				ability_cooldowns = ability_cooldowns,
 				-- Consumables
 				consumables = consumables,
 				-- Exact raw Ammo counts
@@ -1240,8 +1316,8 @@ function SnapshotManager:apply_snapshot(snapshot)
 						if health_ext then
 							health_ext.state = "dead"
 							health_ext.previous_state = "dead"
-							health_ext.set_health_percentage = 0
-							health_ext.set_temporary_health_percentage = 0
+							health_ext.set_health_percentage = nil
+							health_ext.set_temporary_health_percentage = nil
 							if health_ext.health_game_object_id and health_ext.game then
 								GameSession.set_game_object_field(health_ext.game, health_ext.health_game_object_id, "current_health", 0)
 								GameSession.set_game_object_field(health_ext.game, health_ext.health_game_object_id, "current_temporary_health", 0)
@@ -1371,8 +1447,8 @@ function SnapshotManager:apply_snapshot(snapshot)
 								health_ext.state = "knocked_down"
 								health_ext.previous_state = "knocked_down"
 								health_ext.previous_max_health = max_hp
-								health_ext.set_health_percentage = 0
-								health_ext.set_temporary_health_percentage = (max_hp > 0) and (temp_hp / max_hp) or 0
+								health_ext.set_health_percentage = nil
+								health_ext.set_temporary_health_percentage = nil
 								if health_ext.health_game_object_id and health_ext.game then
 									local thp_val = DamageUtils.networkify_health(temp_hp)
 									GameSession.set_game_object_field(health_ext.game, health_ext.health_game_object_id, "current_health", 0)
@@ -1400,8 +1476,8 @@ function SnapshotManager:apply_snapshot(snapshot)
 								health_ext.previous_state = "alive"
 								health_ext.previous_max_health = max_hp
 
-								health_ext.set_health_percentage = (max_hp > 0) and (perm_hp / max_hp) or 1
-								health_ext.set_temporary_health_percentage = (max_hp > 0) and (temp_hp / max_hp) or 0
+								health_ext.set_health_percentage = nil
+								health_ext.set_temporary_health_percentage = nil
 								if health_ext.health_game_object_id and health_ext.game then
 									local perm_val = DamageUtils.networkify_health(perm_hp)
 									local temp_val = DamageUtils.networkify_health(temp_hp)
@@ -1435,6 +1511,13 @@ function SnapshotManager:apply_snapshot(snapshot)
 									p_status.game_mode_data.respawn_unit = nil
 									p_status.game_mode_data.health_percentage = (max_hp > 0) and (perm_hp / max_hp) or 1
 									p_status.game_mode_data.temporary_health_percentage = (max_hp > 0) and (temp_hp / max_hp) or 0
+									-- SpawningHelper reads this native spawn payload while a
+									-- player unit is being initialized.  Keeping it in sync
+									-- prevents the next spawn frame from reapplying the
+									-- pre-restore healing item / potion / bomb inventory.
+									if pl_data.consumables then
+										p_status.game_mode_data.consumables = table.clone(pl_data.consumables)
+									end
 								end
 							end
 						end)
@@ -1518,7 +1601,7 @@ function SnapshotManager:apply_snapshot(snapshot)
 								for _, slot_name in ipairs(consumable_slots) do
 									local desired_item = pl_data.consumables[slot_name]
 									local current_slot_data = inventory_ext:get_slot_data(slot_name)
-									local current_item_key = current_slot_data and current_slot_data.item_data and current_slot_data.item_data.key
+									local current_item_key = current_slot_data and current_slot_data.item_data and current_slot_data.item_data.name
 									local slot_id = NetworkLookup.equipment_slots[slot_name]
 
 									if current_item_key ~= desired_item then
@@ -1545,13 +1628,15 @@ function SnapshotManager:apply_snapshot(snapshot)
 						end)
 					end
 
-					if spawned_player_unit then
-						table.insert(self._pending_player_equipment_restores, {
-							player = matched_player,
-							player_data = pl_data,
-							wait_frames = 1,
-						})
-					end
+					-- Reapply after native spawn/inventory initialization.  This is also
+					-- needed for an already-alive remote husk: its inventory and health
+					-- game objects can be refreshed after the first host-side write.
+					table.insert(self._pending_player_equipment_restores, {
+						player = matched_player,
+						player_data = pl_data,
+						wait_frames = spawned_player_unit and 2 or 1,
+						remaining_applications = 3,
+					})
 
 					-- 5. Restore Career Ability Cooldown (Exact raw seconds)
 					pcall(function()
@@ -1578,7 +1663,7 @@ function SnapshotManager:apply_snapshot(snapshot)
 							local network_manager = Managers.state.network
 							local game = network_manager and network_manager:game()
 							if game and pl_go_id and max_cd > 0 then
-								local ability_pct = math.clamp((max_cd - target_cd) / max_cd, 0, 1)
+								local ability_pct = math.clamp(target_cd / max_cd, 0, 1)
 								GameSession.set_game_object_field(game, pl_go_id, "ability_percentage", ability_pct)
 							end
 
@@ -2118,9 +2203,9 @@ function SnapshotManager:update(dt)
 		end
 	end
 
-	-- Finish equipment restoration for players who had to be spawned during
-	-- snapshot application.  It retains the exact saved ammo and consumables
-	-- rather than using defaults, including if setup takes past the pause point.
+	-- Finish equipment and runtime restoration after native player/inventory
+	-- initialization.  Reapply a few times so host and remote husks cannot
+	-- overwrite saved health, cooldown, ammo, or consumables on their spawn frame.
 	local pending = self._pending_player_equipment_restores
 	if pending and #pending > 0 then
 		for i = #pending, 1, -1 do
@@ -2132,9 +2217,17 @@ function SnapshotManager:update(dt)
 				local unit = player and player.player_unit
 				local go_id = unit and Unit.alive(unit) and _game_object_id_if_ready(unit)
 				if go_id then
-					local ok, restored = pcall(_restore_player_equipment, unit, entry.player_data, go_id, player.remote, Managers.state.network and Managers.state.network.network_transmit)
-					if ok and restored then
-						table.remove(pending, i)
+					local ok, equipment_restored = pcall(_restore_player_equipment, unit, entry.player_data, go_id, player.remote, Managers.state.network and Managers.state.network.network_transmit)
+					local runtime_ok, runtime_restored = pcall(_restore_player_runtime_state, unit, entry.player_data, go_id)
+					if ok and equipment_restored and runtime_ok and runtime_restored then
+						entry.remaining_applications = (entry.remaining_applications or 1) - 1
+						if entry.remaining_applications <= 0 then
+							table.remove(pending, i)
+						else
+							-- Reapply on following settled frames.  Native player and
+							-- inventory initialization may occur after this mod update.
+							entry.wait_frames = 1
+						end
 					else
 						-- The inventory extension can exist one frame before all weapon
 						-- units are linked; retry after a small settling window.
