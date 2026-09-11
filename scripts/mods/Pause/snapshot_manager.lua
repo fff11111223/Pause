@@ -3,7 +3,7 @@
 
 local mod = get_mod("Pause")
 
--- luacheck: globals Managers ScriptWorld Unit ScriptUnit Vector3 Quaternion Vector3Box QuaternionBox Breeds ItemMasterList NetworkLookup cjson ScoreboardHelper
+-- luacheck: globals Managers ScriptWorld Unit ScriptUnit Vector3 Quaternion Vector3Box QuaternionBox Breeds ItemMasterList NetworkLookup cjson ScoreboardHelper BuffUtils
 
 local SnapshotManager = {}
 SnapshotManager.__index = SnapshotManager
@@ -128,6 +128,80 @@ local function _restore_player_equipment(pl_unit, pl_data, pl_go_id, is_remote, 
 	return true
 end
 
+-- BuffExtension keeps one entry per sub-buff, while all sub-buffs created by
+-- one add_buff call share an id.  Only timed/ticking buffs are volatile match
+-- state; permanent career/loadout buffs are created by native player setup and
+-- must not be removed during a rollback.
+local function _capture_temporary_buffs(buff_ext, current_t)
+	local saved, seen_ids = {}, {}
+	if not buff_ext or not buff_ext._buffs then
+		return saved
+	end
+	for i = 1, buff_ext._num_buffs or 0 do
+		local buff = buff_ext._buffs[i]
+		if buff and not buff.removed and not seen_ids[buff.id] and (buff.duration or buff.ticks) then
+			seen_ids[buff.id] = true
+			local remaining = buff.duration and math.max(buff.start_time + buff.duration - current_t, 0) or nil
+			if not remaining or remaining > 0 then
+				saved[#saved + 1] = {
+					buff_template_name = buff.buff_template_name,
+					duration = buff.duration,
+					remaining = remaining,
+					ticks = buff.ticks,
+					current_ticks = buff.current_ticks,
+					bonus = buff.bonus,
+					multiplier = buff.multiplier,
+					value = buff.value,
+					proc_chance = buff.proc_chance,
+					proc_cooldown = buff.proc_cooldown,
+					range = buff.range,
+				}
+			end
+		end
+	end
+	return saved
+end
+
+local function _restore_temporary_buffs(buff_ext, saved_buffs)
+	if not buff_ext or not buff_ext._buffs or not saved_buffs then
+		return
+	end
+
+	-- Use the extension's public remove_buff API so native status effects,
+	-- particles, stat caches, and buff-system synchronization are cleaned up.
+	local ids_to_remove, seen_ids = {}, {}
+	for i = 1, buff_ext._num_buffs or 0 do
+		local buff = buff_ext._buffs[i]
+		if buff and not buff.removed and not seen_ids[buff.id] and (buff.duration or buff.ticks) then
+			seen_ids[buff.id] = true
+			ids_to_remove[#ids_to_remove + 1] = buff.id
+		end
+	end
+	for _, id in ipairs(ids_to_remove) do
+		buff_ext:remove_buff(id)
+	end
+
+	-- Recreate from the original parent template through add_buff.  The native
+	-- hot-join age parameter restores its start time and therefore its remaining
+	-- duration instead of giving the effect a fresh full duration.
+	for _, saved in ipairs(saved_buffs) do
+		if saved.buff_template_name and BuffUtils.get_buff_template(saved.buff_template_name) then
+			local age = saved.duration and math.max(saved.duration - (saved.remaining or 0), 0) or 0
+			buff_ext:add_buff(saved.buff_template_name, {
+				_hot_join_sync_buff_age = age,
+				external_optional_duration = saved.duration,
+				external_optional_ticks = saved.ticks,
+				external_optional_bonus = saved.bonus,
+				external_optional_multiplier = saved.multiplier,
+				external_optional_value = saved.value,
+				external_optional_proc_chance = saved.proc_chance,
+				external_optional_proc_cooldown = saved.proc_cooldown,
+				external_optional_range = saved.range,
+			})
+		end
+	end
+end
+
 -- PlayerUnitHealthExtension stores the authoritative absolute health values in
 -- its health game object.  Its update method consumes the two
 -- `set_*_health_percentage` fields on the next frame, so snapshot restore must
@@ -186,6 +260,11 @@ local function _restore_player_runtime_state(pl_unit, pl_data, pl_go_id)
 			GameSession.set_game_object_field(game, pl_go_id, "ability_percentage", math.clamp(cooldown / max_cooldown, 0, 1))
 		end
 	end
+
+	_restore_temporary_buffs(
+		ScriptUnit.has_extension(pl_unit, "buff_system") and ScriptUnit.extension(pl_unit, "buff_system"),
+		pl_data.temporary_buffs
+	)
 
 	return true
 end
@@ -395,6 +474,7 @@ function SnapshotManager:collect_snapshot()
 			local status_ext = has_unit and ScriptUnit.has_extension(pl_unit, "status_system") and ScriptUnit.extension(pl_unit, "status_system")
 			local career_ext = has_unit and ScriptUnit.has_extension(pl_unit, "career_system") and ScriptUnit.extension(pl_unit, "career_system")
 			local inventory_ext = has_unit and ScriptUnit.has_extension(pl_unit, "inventory_system") and ScriptUnit.extension(pl_unit, "inventory_system")
+			local buff_ext = has_unit and ScriptUnit.has_extension(pl_unit, "buff_system") and ScriptUnit.extension(pl_unit, "buff_system")
 
 			local is_knocked_down = (status_ext and status_ext:is_knocked_down()) or (gm_data and gm_data.health_state == "knocked_down") or false
 			local is_ready_for_assisted_respawn = (status_ext and status_ext:is_ready_for_assisted_respawn()) or (gm_data and gm_data.health_state == "respawn") or false
@@ -596,6 +676,7 @@ function SnapshotManager:collect_snapshot()
 				max_ability_cooldown = max_ability_cooldown,
 				ability_cooldown_percentage = ability_cooldown_percentage,
 				ability_cooldowns = ability_cooldowns,
+				temporary_buffs = _capture_temporary_buffs(buff_ext, current_game_t),
 				-- Consumables
 				consumables = consumables,
 				-- Exact raw Ammo counts
