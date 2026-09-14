@@ -29,11 +29,46 @@ local function _restore_player_equipment(pl_unit, pl_data, pl_go_id, is_remote, 
 	if not inventory_ext or not inventory_ext.get_slot_data then
 		return false
 	end
-	-- Melee and ranged items establish the attachment hierarchy for weapons and ammo.
-	-- Check weapon readiness for ammo, but always allow consumables to restore if inventory extension exists.
-	local weapons_ready = inventory_ext:get_slot_data("slot_melee") and inventory_ext:get_slot_data("slot_ranged")
+	-- 1. Restore Consumables: Independent of weapon attachment readiness.
+	-- As long as inventory_ext exists, restore slot_healthkit, slot_potion, slot_grenade.
+	local consumables_done = true
+	if pl_data.consumables then
+		for _, slot_name in ipairs({ "slot_healthkit", "slot_potion", "slot_grenade" }) do
+			local desired_item = pl_data.consumables[slot_name]
+			local current_slot_data = inventory_ext:get_slot_data(slot_name)
+			-- SimpleInventoryExtension.add_equipment and its RPC use item_data.name
+			-- (the ItemMasterList / NetworkLookup key), not backend item_data.key.
+			local current_item_key = current_slot_data and current_slot_data.item_data and current_slot_data.item_data.name
+			local slot_id = NetworkLookup.equipment_slots[slot_name]
+			if current_item_key ~= desired_item then
+				if current_slot_data then
+					inventory_ext:destroy_slot(slot_name)
+					if network_transmit and slot_id then
+						network_transmit:send_rpc_clients("rpc_destroy_slot", pl_go_id, slot_id)
+					end
+				end
+				if desired_item and rawget(ItemMasterList, desired_item) then
+					inventory_ext:add_equipment(slot_name, desired_item)
+					if network_transmit and slot_id then
+						local item_id = NetworkLookup.item_names[desired_item]
+						local skin_id = NetworkLookup.weapon_skins["n/a"]
+						if item_id and skin_id then
+							network_transmit:send_rpc_clients("rpc_add_equipment", pl_go_id, slot_id, item_id, skin_id)
+						end
+					end
+				end
+			end
+		end
+	end
 
-	if weapons_ready and pl_data.ammo and pl_data.ammo.slot_ranged then
+	-- 2. Restore Weapons / Ammo: Check weapon slot readiness.
+	-- The melee and ranged items establish the attachment hierarchy used by ammo systems.
+	local weapons_ready = inventory_ext:get_slot_data("slot_melee") and inventory_ext:get_slot_data("slot_ranged")
+	if not weapons_ready then
+		return false
+	end
+
+	if pl_data.ammo and pl_data.ammo.slot_ranged then
 		local ranged_ammo = pl_data.ammo.slot_ranged
 		local ammo_system = Managers.state.entity and Managers.state.entity:system("ammo_system")
 		if ammo_system then
@@ -87,35 +122,6 @@ local function _restore_player_equipment(pl_unit, pl_data, pl_go_id, is_remote, 
 					ammo_ext._shots_fired = 0
 					if ammo_ext._update_anim_ammo then
 						ammo_ext:_update_anim_ammo()
-					end
-				end
-			end
-		end
-	end
-
-	if pl_data.consumables then
-		for _, slot_name in ipairs({ "slot_healthkit", "slot_potion", "slot_grenade" }) do
-			local desired_item = pl_data.consumables[slot_name]
-			local current_slot_data = inventory_ext:get_slot_data(slot_name)
-			-- SimpleInventoryExtension.add_equipment and its RPC use item_data.name
-			-- (the ItemMasterList / NetworkLookup key), not backend item_data.key.
-			local current_item_key = current_slot_data and current_slot_data.item_data and current_slot_data.item_data.name
-			local slot_id = NetworkLookup.equipment_slots[slot_name]
-			if current_item_key ~= desired_item then
-				if current_slot_data then
-					inventory_ext:destroy_slot(slot_name)
-					if network_transmit and slot_id then
-						network_transmit:send_rpc_clients("rpc_destroy_slot", pl_go_id, slot_id)
-					end
-				end
-				if desired_item and rawget(ItemMasterList, desired_item) then
-					inventory_ext:add_equipment(slot_name, desired_item)
-					if network_transmit and slot_id then
-						local item_id = NetworkLookup.item_names[desired_item]
-						local skin_id = NetworkLookup.weapon_skins["n/a"]
-						if item_id and skin_id then
-							network_transmit:send_rpc_clients("rpc_add_equipment", pl_go_id, slot_id, item_id, skin_id)
-						end
 					end
 				end
 			end
@@ -214,13 +220,34 @@ local function _restore_player_runtime_state(pl_unit, pl_data, pl_go_id)
 	local was_dead = pl_data.is_dead == true
 	local was_knocked_down = pl_data.is_knocked_down == true
 
-	if not was_dead and health_ext and health_ext.game and health_ext.health_game_object_id then
+	if was_dead then
+		-- DEAD STATE: Strictly maintain dead state, never overwrite to alive or knocked down
+		if health_ext then
+			health_ext.state = "dead"
+			health_ext.previous_state = "dead"
+			health_ext.set_health_percentage = nil
+			health_ext.set_temporary_health_percentage = nil
+			if health_ext.health_game_object_id and health_ext.game then
+				GameSession.set_game_object_field(health_ext.game, health_ext.health_game_object_id, "current_health", 0)
+				GameSession.set_game_object_field(health_ext.game, health_ext.health_game_object_id, "current_temporary_health", 0)
+			end
+		end
+		if status_ext then
+			status_ext:set_dead(true)
+		end
+	elseif health_ext and health_ext.game and health_ext.health_game_object_id then
 		local game = health_ext.game
 		local health_go_id = health_ext.health_game_object_id
 		local native_max_health = GameSession.game_object_field(game, health_go_id, "max_health")
 		if native_max_health and native_max_health > 0 then
 			if was_knocked_down then
-				-- KNOCKED DOWN STATE
+				-- KNOCKED DOWN STATE: Strictly maintain knocked_down, never overwrite to alive
+				if status_ext then
+					status_ext.dead = false
+					if not status_ext:is_knocked_down() then
+						StatusUtils.set_knocked_down_network(pl_unit, true)
+					end
+				end
 				health_ext.state = "knocked_down"
 				health_ext.previous_state = "knocked_down"
 				health_ext.previous_max_health = native_max_health
@@ -231,7 +258,15 @@ local function _restore_player_runtime_state(pl_unit, pl_data, pl_go_id)
 				GameSession.set_game_object_field(game, health_go_id, "current_temporary_health", DamageUtils.networkify_health(temporary))
 				health_ext.damage = native_max_health
 			else
-				-- ALIVE STATE
+				-- ALIVE STATE: Strictly maintain alive, never overwrite to knocked down or dead
+				if status_ext then
+					if status_ext:is_knocked_down() then
+						StatusUtils.set_knocked_down_network(pl_unit, false)
+					end
+					if status_ext:is_dead() then
+						status_ext:set_dead(false)
+					end
+				end
 				local permanent = math.clamp(pl_data.current_permanent_health or 0, 0, native_max_health)
 				local temporary = math.clamp(pl_data.current_temporary_health or 0, 0, native_max_health)
 
