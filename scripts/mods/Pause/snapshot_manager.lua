@@ -449,6 +449,8 @@ function SnapshotManager:init()
 	self._restore_not_completed_logged = false
 	self._restore_logged_players = {}
 	self._restore_subsystems_done = {}
+	self._restore_subsystem_errors = {}
+	self._restore_failed = false
 end
 
 function SnapshotManager:has_pending_enemy_restores()
@@ -1383,6 +1385,8 @@ function SnapshotManager:apply_snapshot(snapshot)
 	-- Gameplay must remain paused throughout the entire restore process.
 	self._restore_state = "restoring"
 	self._restore_subsystems_done = {}
+	self._restore_subsystem_errors = {}
+	self._restore_failed = false
 	self._restore_total_enemies = 0
 	self._restore_last_logged_enemy_milestone = -1
 	self._restore_not_completed_logged = false
@@ -1411,40 +1415,64 @@ function SnapshotManager:apply_snapshot(snapshot)
 	end)
 
 	-- 1. Restore Level Seed & Analysis
-	pcall(function()
+	local level_ok, level_err = pcall(function()
 		if snapshot.level_seed and Managers.state.conflict and Managers.state.conflict.level_analysis then
 			Managers.state.conflict.level_analysis:set_random_seed(snapshot.level_analysis, snapshot.level_seed)
 		end
 	end)
-	self._restore_subsystems_done["level_analysis"] = true
-	mod:chat_broadcast("[Pause] Restore: LevelAnalysis completed")
+	if level_ok then
+		self._restore_subsystems_done["level_analysis"] = true
+		mod:chat_broadcast("[Pause] Restore: LevelAnalysis completed")
+	else
+		self._restore_failed = true
+		self._restore_subsystem_errors["level_analysis"] = tostring(level_err)
+		mod:chat_broadcast("[Pause] Restore: LevelAnalysis failed - " .. tostring(level_err))
+	end
 
 	-- 2. Restore Missions (Completed & Active)
-	pcall(function()
+	local mission_ok, mission_err = pcall(function()
 		if snapshot.missions and Managers.state.entity:system("mission_system") then
 			Managers.state.entity:system("mission_system"):load_checkpoint_data(snapshot.missions)
 		end
 	end)
-	self._restore_subsystems_done["missions"] = true
-	mod:chat_broadcast("[Pause] Restore: MissionSystem completed")
+	if mission_ok then
+		self._restore_subsystems_done["missions"] = true
+		mod:chat_broadcast("[Pause] Restore: MissionSystem completed")
+	else
+		self._restore_failed = true
+		self._restore_subsystem_errors["missions"] = tostring(mission_err)
+		mod:chat_broadcast("[Pause] Restore: MissionSystem failed - " .. tostring(mission_err))
+	end
 
 	-- 3. Restore Networked Flow State (Doors, bridges, event triggers)
-	pcall(function()
+	local flow_ok, flow_err = pcall(function()
 		if snapshot.networked_flow and Managers.state.networked_flow_state then
 			Managers.state.networked_flow_state:load_checkpoint_data(snapshot.networked_flow)
 		end
 	end)
-	self._restore_subsystems_done["networked_flow"] = true
-	mod:chat_broadcast("[Pause] Restore: NetworkedFlowState completed")
+	if flow_ok then
+		self._restore_subsystems_done["networked_flow"] = true
+		mod:chat_broadcast("[Pause] Restore: NetworkedFlowState completed")
+	else
+		self._restore_failed = true
+		self._restore_subsystem_errors["networked_flow"] = tostring(flow_err)
+		mod:chat_broadcast("[Pause] Restore: NetworkedFlowState failed - " .. tostring(flow_err))
+	end
 
 	-- 4. Restore Taken Pickups (Tomest/Grimoires/Items already taken)
-	pcall(function()
+	local pickup_ok, pickup_err = pcall(function()
 		if snapshot.pickups and Managers.state.entity:system("pickup_system") then
 			Managers.state.entity:system("pickup_system"):setup_taken_pickups(snapshot.pickups)
 		end
 	end)
-	self._restore_subsystems_done["pickups"] = true
-	mod:chat_broadcast("[Pause] Restore: PickupSystem completed")
+	if pickup_ok then
+		self._restore_subsystems_done["pickups"] = true
+		mod:chat_broadcast("[Pause] Restore: PickupSystem completed")
+	else
+		self._restore_failed = true
+		self._restore_subsystem_errors["pickups"] = tostring(pickup_err)
+		mod:chat_broadcast("[Pause] Restore: PickupSystem failed - " .. tostring(pickup_err))
+	end
 
 	-- 5. Restore Players (Teleport, Status, HP, THP, Ammo, Consumables, Cooldown)
 	local pl_ok, pl_err = pcall(function()
@@ -1905,11 +1933,14 @@ function SnapshotManager:apply_snapshot(snapshot)
 		end
 	end
 end)
-	if not pl_ok then
-		mod:echo("[Snapshot] Player restore error: " .. tostring(pl_err))
+	if pl_ok then
+		self._restore_subsystems_done["players"] = true
+		mod:chat_broadcast("[Pause] Restore: players completed")
+	else
+		self._restore_failed = true
+		self._restore_subsystem_errors["players"] = tostring(pl_err)
+		mod:chat_broadcast("[Pause] Restore: players failed - " .. tostring(pl_err))
 	end
-	self._restore_subsystems_done["players"] = true
-	mod:chat_broadcast("[Pause] Restore: players completed")
 
 	-- 6. Destroy random level mobs and recreate exact living enemies safely with preserved HP
 	local en_ok, en_err = pcall(function()
@@ -1973,9 +2004,10 @@ end)
 		end
 	end)
 	if not en_ok then
-		mod:echo("[Snapshot] Enemy restore error: " .. tostring(en_err))
-	end
-	if not (self._pending_enemy_restores and #self._pending_enemy_restores > 0) then
+		self._restore_failed = true
+		self._restore_subsystem_errors["enemies"] = tostring(en_err)
+		mod:chat_broadcast("[Pause] Restore: enemy spawn failed - " .. tostring(en_err))
+	elseif not (self._pending_enemy_restores and #self._pending_enemy_restores > 0) then
 		self._restore_subsystems_done["enemies"] = true
 		mod:chat_broadcast("[Pause] Restore: enemies completed (0 queued)")
 	end
@@ -2135,11 +2167,14 @@ end)
 			horde_spawner._running_horde_sound_settings = nil
 		end
 	end)
-	if not horde_ok then
-		mod:echo("[Snapshot] Horde restore error: " .. tostring(horde_err))
+	if horde_ok then
+		self._restore_subsystems_done["horde_spawner"] = true
+		mod:chat_broadcast("[Pause] Restore: horde_spawner completed")
+	else
+		self._restore_failed = true
+		self._restore_subsystem_errors["horde_spawner"] = tostring(horde_err)
+		mod:chat_broadcast("[Pause] Restore: horde_spawner failed - " .. tostring(horde_err))
 	end
-	self._restore_subsystems_done["horde_spawner"] = true
-	mod:chat_broadcast("[Pause] Restore: horde_spawner completed")
 
 	-- 8. Restore Conflict Director Pacing & Horde Timing State
 	local pacing_ok, pacing_err = pcall(function()
@@ -2281,14 +2316,17 @@ end)
 			end
 		end
 	end)
-	if not pacing_ok then
-		mod:echo("[Snapshot] Conflict pacing restore error: " .. tostring(pacing_err))
+	if pacing_ok then
+		self._restore_subsystems_done["conflict_pacing"] = true
+		mod:chat_broadcast("[Pause] Restore: conflict_pacing completed")
+	else
+		self._restore_failed = true
+		self._restore_subsystem_errors["conflict_pacing"] = tostring(pacing_err)
+		mod:chat_broadcast("[Pause] Restore: conflict_pacing failed - " .. tostring(pacing_err))
 	end
-	self._restore_subsystems_done["conflict_pacing"] = true
-	mod:chat_broadcast("[Pause] Restore: conflict_pacing completed")
 
 	-- 9. Restore Scoreboard Statistics (Full Rollback to exact snapshot stats & network sync)
-	pcall(function()
+	local score_ok, score_err = pcall(function()
 		local statistics_db = Managers.player and Managers.player:statistics_db()
 		local current_players = Managers.player and Managers.player:players()
 		if statistics_db and current_players and snapshot.scoreboard then
@@ -2405,8 +2443,14 @@ end)
 		end
 	end)
 
-	self._restore_subsystems_done["scoreboard"] = true
-	mod:chat_broadcast("[Pause] Restore: scoreboard completed")
+	if score_ok then
+		self._restore_subsystems_done["scoreboard"] = true
+		mod:chat_broadcast("[Pause] Restore: scoreboard completed")
+	else
+		self._restore_failed = true
+		self._restore_subsystem_errors["scoreboard"] = tostring(score_err)
+		mod:chat_broadcast("[Pause] Restore: scoreboard failed - " .. tostring(score_err))
+	end
 	return true
 end
 
@@ -2499,7 +2543,10 @@ function SnapshotManager:update(dt)
 				if apply_ok then
 					table.remove(pending_enemies, i)
 				elseif apply_err then
-					mod:echo("[Pause] Restore: enemy error: " .. tostring(apply_err))
+					-- Fatal error on enemy restore: mark subsystem failed so it will NEVER be completed
+					self._restore_failed = true
+					self._restore_subsystem_errors["enemies"] = tostring(apply_err)
+					mod:chat_broadcast("[Pause] Restore: enemy restore error - " .. tostring(apply_err))
 					table.remove(pending_enemies, i)
 				end
 			end
@@ -2517,7 +2564,7 @@ function SnapshotManager:update(dt)
 			end
 		end
 
-		if #pending_enemies == 0 and not self._restore_subsystems_done["enemies"] then
+		if #pending_enemies == 0 and not self._restore_subsystems_done["enemies"] and not self._restore_failed then
 			self._restore_subsystems_done["enemies"] = true
 			mod:chat_broadcast("[Pause] Restore: enemies completed")
 		end
@@ -2526,30 +2573,35 @@ function SnapshotManager:update(dt)
 	-- Completion detection across all required subsystems
 	local pl_done = not pending or #pending == 0
 	local en_done = not pending_enemies or #pending_enemies == 0
-	if pl_done and not self._restore_subsystems_done["players_async"] then
+	if pl_done and not self._restore_subsystems_done["players_async"] and not self._restore_failed then
 		self._restore_subsystems_done["players_async"] = true
 	end
-	if en_done and not self._restore_subsystems_done["enemies"] then
+	if en_done and not self._restore_subsystems_done["enemies"] and not self._restore_failed then
 		self._restore_subsystems_done["enemies"] = true
 	end
 
 	if self._restore_state == "restoring" then
-		local done = self._restore_subsystems_done
-		local all_done = done["snapshot_state"]
-			and done["level_analysis"]
-			and done["missions"]
-			and done["networked_flow"]
-			and done["pickups"]
-			and done["players"]
-			and done["players_async"]
-			and done["enemies"]
-			and done["horde_spawner"]
-			and done["conflict_pacing"]
-			and done["scoreboard"]
+		if self._restore_failed then
+			self._restore_state = "failed"
+			mod:chat_broadcast("[Pause] Restore snapshot failed (check chat for error details)")
+		else
+			local done = self._restore_subsystems_done
+			local all_done = done["snapshot_state"]
+				and done["level_analysis"]
+				and done["missions"]
+				and done["networked_flow"]
+				and done["pickups"]
+				and done["players"]
+				and done["players_async"]
+				and done["enemies"]
+				and done["horde_spawner"]
+				and done["conflict_pacing"]
+				and done["scoreboard"]
 
-		if all_done then
-			self._restore_state = "completed"
-			mod:chat_broadcast("[Pause] Restore snapshot completed")
+			if all_done then
+				self._restore_state = "completed"
+				mod:chat_broadcast("[Pause] Restore snapshot completed")
+			end
 		end
 	end
 
