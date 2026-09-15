@@ -1,4 +1,4 @@
-﻿-- SnapshotManager for Pause mod
+-- SnapshotManager for Pause mod
 -- Provides robust capture, persistence, and recovery of level progress, seeds, players, enemies, and stats across Host crashes.
 
 local mod = get_mod("Pause")
@@ -441,10 +441,35 @@ function SnapshotManager:init()
 	self._auto_timer = 0
 	self._level_prompted = false
 	self._last_loaded_level = nil
-	self._pause_after_restore_countdown = nil
-	self._inventory_updates_after_restore_pause = nil
 	self._pending_player_equipment_restores = {}
 	self._pending_enemy_restores = {}
+	self._restore_state = "idle"
+	self._restore_total_enemies = 0
+	self._restore_last_logged_enemy_milestone = -1
+	self._restore_not_completed_logged = false
+	self._restore_logged_players = {}
+end
+
+function SnapshotManager:has_pending_enemy_restores()
+	return self._restore_state == "restoring" and self._pending_enemy_restores and #self._pending_enemy_restores > 0
+end
+
+function SnapshotManager:has_pending_equipment_for_unit(unit)
+	if self._restore_state ~= "restoring" then
+		return false
+	end
+	local pending = self._pending_player_equipment_restores
+	if not pending or #pending == 0 then
+		return false
+	end
+	for i = 1, #pending do
+		local entry = pending[i]
+		local p = entry and entry.player
+		if p and p.player_unit == unit then
+			return true
+		end
+	end
+	return false
 end
 
 --- Collect complete level, flow, player, enemy, and scoreboard state
@@ -1848,10 +1873,12 @@ function SnapshotManager:apply_snapshot(snapshot)
 						end
 					end)
 
-					-- Debug notification for verification
+					-- Per-player completion log (immediate restore phase)
 					local hero_str = pl_data.hero_name or (matched_player.character_name and matched_player:character_name()) or "Player"
-					mod:echo(string.format("[Snapshot] Restored %s: HP=%.1f/%.1f, THP=%.1f, State=%s",
-						hero_str, perm_hp, max_hp, temp_hp, was_knocked_down and "Downed" or "Alive"))
+					local state_str = was_knocked_down and "Downed" or "Alive"
+					mod:chat_broadcast("[Pause] Restore: player " .. hero_str .. " HP/THP completed"
+						.. " (HP=" .. string.format("%.1f", perm_hp) .. "/" .. string.format("%.1f", max_hp)
+						.. " THP=" .. string.format("%.1f", temp_hp) .. " State=" .. state_str .. ")")
 				end
 			end
 		end
@@ -1914,9 +1941,14 @@ end)
 			-- queued spawning and NetworkUnitStorage has assigned each unit an ID.
 			self._pending_enemy_restores = queued_spawns
 
-			-- Give the normal queue enough frames to finish without re-entering it
-			-- manually from the restore call stack.
-			mod._allow_director_updates = math.max(60, #queued_spawns * 2)
+			-- Transition to restoring state; update() loop handles pending enemies.
+			self._restore_state = "restoring"
+			self._restore_total_enemies = #queued_spawns
+			self._restore_last_logged_enemy_milestone = -1
+			if #queued_spawns > 0 then
+				local cnt = tostring(#queued_spawns)
+				mod:chat_broadcast("[Pause] Restore: enemies restoring (0/" .. cnt .. ")")
+			end
 		end
 	end)
 	if not en_ok then
@@ -2344,34 +2376,14 @@ end)
 		end
 	end)
 
-	-- Pause after the usual three-frame restore window.  Let the inventory
-	-- system alone run for a few more paused frames so newly spawned weapons
-	-- can finish linking to their attachment nodes.
-	self._inventory_updates_after_restore_pause = 7
-	self._pause_after_restore_countdown = 3
-
-	local seed_str = tostring(snapshot.level_seed or "default")
-	local applied_msg = mod:safe_localize("snapshot_applied_seed", seed_str)
-	mod:chat_broadcast(applied_msg)
+	mod:chat_broadcast("[Pause] Restore: scoreboard completed")
+	-- apply_snapshot done; pending queues in update() will announce final completion.
 	return true
 end
 
 --- Update loop for periodic auto-snapshot and level-start detection prompt
 function SnapshotManager:update(dt)
-	-- Handle delayed pause countdown after snapshot restore (allows player equipment setup to finish)
-	if self._pause_after_restore_countdown then
-		self._pause_after_restore_countdown = self._pause_after_restore_countdown - 1
-		if self._pause_after_restore_countdown <= 0 then
-			self._pause_after_restore_countdown = nil
-			mod._allow_inventory_updates = self._inventory_updates_after_restore_pause or 0
-			self._inventory_updates_after_restore_pause = nil
-			mod:apply_pause_state(true, true)
-		end
-	end
-
-	-- Finish equipment and runtime restoration after native player/inventory
-	-- initialization.  Reapply a few times so host and remote husks cannot
-	-- overwrite saved health, cooldown, ammo, or consumables on their spawn frame.
+	-- Pending player equipment/runtime restores
 	local pending = self._pending_player_equipment_restores
 	if pending and #pending > 0 then
 		for i = #pending, 1, -1 do
@@ -2380,23 +2392,31 @@ function SnapshotManager:update(dt)
 				entry.wait_frames = entry.wait_frames - 1
 			else
 				local player = entry.player
-				local unit = player and player.player_unit
-				local go_id = unit and Unit.alive(unit) and _game_object_id_if_ready(unit)
+				local unit   = player and player.player_unit
+				local go_id  = unit and Unit.alive(unit) and _game_object_id_if_ready(unit)
 				if go_id then
 					local ok, equipment_restored = pcall(_restore_player_equipment, unit, entry.player_data, go_id, player.remote, Managers.state.network and Managers.state.network.network_transmit)
 					local runtime_ok, runtime_restored = pcall(_restore_player_runtime_state, unit, entry.player_data, go_id)
 					if ok and equipment_restored and runtime_ok and runtime_restored then
 						entry.remaining_applications = (entry.remaining_applications or 1) - 1
 						if entry.remaining_applications <= 0 then
+							local hero_str = (entry.player_data and entry.player_data.hero_name)
+								or (player.character_name and player:character_name()) or "Player"
+							if not self._restore_logged_players[hero_str] then
+								self._restore_logged_players[hero_str] = true
+								mod:chat_broadcast("[Pause] Restore: player " .. hero_str .. " equipment completed")
+							end
 							table.remove(pending, i)
 						else
-							-- Reapply on following settled frames.  Native player and
-							-- inventory initialization may occur after this mod update.
 							entry.wait_frames = 1
 						end
 					else
-						-- The inventory extension can exist one frame before all weapon
-						-- units are linked; retry after a small settling window.
+						if not entry.pending_logged then
+							entry.pending_logged = true
+							local hero_str = (entry.player_data and entry.player_data.hero_name)
+								or (player.character_name and player:character_name()) or "Player"
+							mod:chat_broadcast("[Pause] Restore: player " .. hero_str .. " equipment pending - inventory not ready")
+						end
 						entry.wait_frames = 2
 					end
 				end
@@ -2404,27 +2424,25 @@ function SnapshotManager:update(dt)
 		end
 	end
 
-	-- A queued enemy becomes safe to touch only after the director has spawned
-	-- it and NetworkUnitStorage has registered its game object.  Applying saved
-	-- health earlier was the remaining route into stale native game-object data.
+	-- Pending enemy restores
 	local pending_enemies = self._pending_enemy_restores
 	if pending_enemies and #pending_enemies > 0 then
+		local total = self._restore_total_enemies or #pending_enemies
 		for i = #pending_enemies, 1, -1 do
-			local entry = pending_enemies[i]
+			local entry      = pending_enemies[i]
 			local enemy_unit = entry.unit_data and entry.unit_data[1]
 			if enemy_unit and Unit.alive(enemy_unit) and _game_object_id_if_ready(enemy_unit) then
 				local restored = pcall(function()
 					if entry.damage_taken > 0 then
 						local health_ext = ScriptUnit.has_extension(enemy_unit, "health_system") and ScriptUnit.extension(enemy_unit, "health_system")
 						if health_ext and health_ext.set_server_damage_taken then
-							local max_hp = health_ext:get_max_health()
-							local safe_damage = math.min(entry.damage_taken, max_hp - 1)
-							if safe_damage > 0 then
-								health_ext:set_server_damage_taken(safe_damage)
+							local max_hp   = health_ext:get_max_health()
+							local safe_dmg = math.min(entry.damage_taken, max_hp - 1)
+							if safe_dmg > 0 then
+								health_ext:set_server_damage_taken(safe_dmg)
 							end
 						end
 					end
-
 					if entry.is_boss then
 						Managers.state.event:trigger("force_add_boss_health_ui", enemy_unit)
 						Managers.state.event:trigger("boss_health_bar_register_unit", enemy_unit, "forced")
@@ -2435,6 +2453,25 @@ function SnapshotManager:update(dt)
 				end
 			end
 		end
+		-- Milestone logging every 10%
+		if total > 0 then
+			local done      = total - #pending_enemies
+			local milestone = math.floor(done / total * 10)
+			local last      = self._restore_last_logged_enemy_milestone or -1
+			if milestone > last then
+				self._restore_last_logged_enemy_milestone = milestone
+				local pct_str = tostring(math.floor(done / total * 100))
+				mod:chat_broadcast("[Pause] Restore: enemies " .. tostring(done) .. "/" .. tostring(total) .. " (" .. pct_str .. "%)")
+			end
+		end
+	end
+
+	-- Completion detection
+	local pl_done = not pending or #pending == 0
+	local en_done = not pending_enemies or #pending_enemies == 0
+	if self._restore_state == "restoring" and pl_done and en_done then
+		self._restore_state = "completed"
+		mod:chat_broadcast("[Pause] Restore snapshot completed")
 	end
 
 	if not mod.is_in_game() or not Managers.player or not Managers.player.is_server then

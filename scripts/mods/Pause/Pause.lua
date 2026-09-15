@@ -1,4 +1,4 @@
-﻿local mod = get_mod("Pause") -- luacheck: ignore get_mod
+local mod = get_mod("Pause") -- luacheck: ignore get_mod
 
 -- luacheck: globals Managers ScriptWorld Unit ScriptUnit Vector3 Quaternion ConflictDirector NetworkServer NetworkLookup GenericCharacterStateMachineExtension SimpleInventoryExtension ActionBase
 -- luacheck: globals GameSession NetworkConstants AILineOfSightExtension PlayerHuskLocomotionExtension TagQueryDatabase BossHealthUI AnimationSystem GameNetworkManager AISystem BLACKBOARDS POSITION_LOOKUP StatisticsDefinitions
@@ -429,10 +429,10 @@ end
 -- Hook ConflictDirector to halt AI director/pacing/spawns during pause.
 -- mod._allow_director_updates allows frames through after snapshot restore
 -- so that spawn_queued_unit enemies get flushed from the queue before re-pausing.
-mod._allow_director_updates = 0
+-- Restore-only allowance handles spawn queue and equipment attachment directly.
 -- Allows a few inventory updates after a snapshot restore has re-paused.  This
 -- completes weapon attachment setup without resuming gameplay.
-mod._allow_inventory_updates = 0
+
 
 -- Networked animation helpers assert if a newly spawned unit has not yet been
 -- inserted into NetworkUnitStorage.  Keep the local animation, but suppress
@@ -535,9 +535,13 @@ end
 
 mod:hook(ConflictDirector, "update", function(func, self, dt, t)
 	if mod.is_paused then
-		if mod._allow_director_updates and mod._allow_director_updates > 0 then
-			mod._allow_director_updates = mod._allow_director_updates - 1
-			return func(self, dt, t)
+		-- Restore-only allowance: only update the spawn queue if enemy restores are pending,
+		-- completely blocking pacing, horde timers, threat updates, and all other gameplay systems.
+		local sm = mod.snapshot_manager
+		if sm and sm:has_pending_enemy_restores() then
+			if self.update_spawn_queue then
+				self:update_spawn_queue(t)
+			end
 		end
 		return
 	end
@@ -555,14 +559,15 @@ end)
 -- Hook Inventory Extension to prevent weapon switching & equipment updates during pause
 mod:hook(SimpleInventoryExtension, "update", function(func, self, unit, input, dt, context, t)
 	if mod.is_paused then
-		if mod._allow_inventory_updates and mod._allow_inventory_updates > 0 then
+		-- Restore-only allowance: only allow loadout attachment resync during pending restore
+		local sm = mod.snapshot_manager
+		if sm and sm:has_pending_equipment_for_unit(unit) then
 			return func(self, unit, input, dt, context, t)
 		end
 		return
 	end
 	return func(self, unit, input, dt, context, t)
 end)
-
 -- Hook ActionBase to block any new weapon attacks, swings, shots, or casts from starting during pause
 mod:hook(ActionBase, "client_owner_start_action", function(func, self, new_action, t, chain_action_data, power_level, action_init_data)
 	if mod.is_paused then
@@ -614,11 +619,6 @@ mod.update = function(dt)
 			end
 		end
 
-		-- The inventory allowance is frame-based, rather than per unit update,
-		-- so every player's attachment setup gets the same restore window.
-		if mod.is_paused and mod._allow_inventory_updates and mod._allow_inventory_updates > 0 then
-			mod._allow_inventory_updates = mod._allow_inventory_updates - 1
-		end
 	end)
 end
 
