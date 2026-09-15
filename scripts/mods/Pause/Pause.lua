@@ -140,18 +140,39 @@ mod.sync_stat_to_clients = function(peer_id, local_player_id, path_array, value)
 
 		-- Fatshark's rpc_sync_statistics_number asserts that persistent_value MUST be 0
 		-- if the stat does not have a database_name.
-		local statistics_db = Managers.player and Managers.player:statistics_db()
-		local player = Managers.player and Managers.player:player(peer_id, local_player_id)
-		if statistics_db and player and statistics_db.statistics then
-			local stats_id = player:stats_id()
-			local node = statistics_db.statistics[stats_id]
+		local has_database_name = false
+		local def = rawget(_G, "StatisticsDefinitions") and StatisticsDefinitions.player
+		if def then
+			local cur_def = def
 			for i = 1, #path_array do
-				if not node then break end
-				node = node[path_array[i]]
+				if not cur_def then break end
+				cur_def = cur_def[path_array[i]]
 			end
-			if node and node.database_name then
-				persistent_val = val
+			if cur_def and cur_def.database_name then
+				has_database_name = true
 			end
+		end
+
+		if not has_database_name then
+			local statistics_db = Managers.player and Managers.player:statistics_db()
+			local player = Managers.player and Managers.player:player(peer_id, local_player_id)
+			if statistics_db and player and statistics_db.statistics then
+				local stats_id = player:stats_id()
+				local node = statistics_db.statistics[stats_id]
+				for i = 1, #path_array do
+					if not node then break end
+					node = node[path_array[i]]
+				end
+				if node and node.database_name then
+					has_database_name = true
+				end
+			end
+		end
+
+		if has_database_name then
+			persistent_val = val
+		else
+			persistent_val = 0
 		end
 
 		Managers.state.network.network_transmit:send_rpc_clients(
