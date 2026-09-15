@@ -448,6 +448,7 @@ function SnapshotManager:init()
 	self._restore_last_logged_enemy_milestone = -1
 	self._restore_not_completed_logged = false
 	self._restore_logged_players = {}
+	self._restore_subsystems_done = {}
 end
 
 function SnapshotManager:has_pending_enemy_restores()
@@ -1378,10 +1379,23 @@ function SnapshotManager:apply_snapshot(snapshot)
 		return false
 	end
 
-	-- If previously paused, temporarily unpause so physics, camera and units can process restore and render
-	if mod.is_paused then
-		mod:apply_pause_state(false)
+	-- Immediately enter Pause and initialize restore tracking.
+	-- Gameplay must remain paused throughout the entire restore process.
+	self._restore_state = "restoring"
+	self._restore_subsystems_done = {}
+	self._restore_total_enemies = 0
+	self._restore_last_logged_enemy_milestone = -1
+	self._restore_not_completed_logged = false
+	self._restore_logged_players = {}
+	self._pending_player_equipment_restores = {}
+	self._pending_enemy_restores = {}
+
+	if not mod.is_paused then
+		mod:apply_pause_state(true, true)
 	end
+	mod:chat_broadcast("[Pause] Restore snapshot started")
+	self._restore_subsystems_done["snapshot_state"] = true
+	mod:chat_broadcast("[Pause] Restore: snapshot state completed")
 
 	-- Clear dialogue system queries and playing dialogues to avoid invalid key to 'next' crash during restore
 	pcall(function()
@@ -1402,6 +1416,8 @@ function SnapshotManager:apply_snapshot(snapshot)
 			Managers.state.conflict.level_analysis:set_random_seed(snapshot.level_analysis, snapshot.level_seed)
 		end
 	end)
+	self._restore_subsystems_done["level_analysis"] = true
+	mod:chat_broadcast("[Pause] Restore: LevelAnalysis completed")
 
 	-- 2. Restore Missions (Completed & Active)
 	pcall(function()
@@ -1409,6 +1425,8 @@ function SnapshotManager:apply_snapshot(snapshot)
 			Managers.state.entity:system("mission_system"):load_checkpoint_data(snapshot.missions)
 		end
 	end)
+	self._restore_subsystems_done["missions"] = true
+	mod:chat_broadcast("[Pause] Restore: MissionSystem completed")
 
 	-- 3. Restore Networked Flow State (Doors, bridges, event triggers)
 	pcall(function()
@@ -1416,6 +1434,8 @@ function SnapshotManager:apply_snapshot(snapshot)
 			Managers.state.networked_flow_state:load_checkpoint_data(snapshot.networked_flow)
 		end
 	end)
+	self._restore_subsystems_done["networked_flow"] = true
+	mod:chat_broadcast("[Pause] Restore: NetworkedFlowState completed")
 
 	-- 4. Restore Taken Pickups (Tomest/Grimoires/Items already taken)
 	pcall(function()
@@ -1423,6 +1443,8 @@ function SnapshotManager:apply_snapshot(snapshot)
 			Managers.state.entity:system("pickup_system"):setup_taken_pickups(snapshot.pickups)
 		end
 	end)
+	self._restore_subsystems_done["pickups"] = true
+	mod:chat_broadcast("[Pause] Restore: PickupSystem completed")
 
 	-- 5. Restore Players (Teleport, Status, HP, THP, Ammo, Consumables, Cooldown)
 	local pl_ok, pl_err = pcall(function()
@@ -1834,7 +1856,6 @@ function SnapshotManager:apply_snapshot(snapshot)
 						player = matched_player,
 						player_data = pl_data,
 						wait_frames = spawned_player_unit and 2 or 1,
-						remaining_applications = 3,
 					})
 
 					-- 5. Restore Career Ability Cooldown (Exact raw seconds)
@@ -1887,6 +1908,8 @@ end)
 	if not pl_ok then
 		mod:echo("[Snapshot] Player restore error: " .. tostring(pl_err))
 	end
+	self._restore_subsystems_done["players"] = true
+	mod:chat_broadcast("[Pause] Restore: players completed")
 
 	-- 6. Destroy random level mobs and recreate exact living enemies safely with preserved HP
 	local en_ok, en_err = pcall(function()
@@ -1941,8 +1964,6 @@ end)
 			-- queued spawning and NetworkUnitStorage has assigned each unit an ID.
 			self._pending_enemy_restores = queued_spawns
 
-			-- Transition to restoring state; update() loop handles pending enemies.
-			self._restore_state = "restoring"
 			self._restore_total_enemies = #queued_spawns
 			self._restore_last_logged_enemy_milestone = -1
 			if #queued_spawns > 0 then
@@ -1953,6 +1974,10 @@ end)
 	end)
 	if not en_ok then
 		mod:echo("[Snapshot] Enemy restore error: " .. tostring(en_err))
+	end
+	if not (self._pending_enemy_restores and #self._pending_enemy_restores > 0) then
+		self._restore_subsystems_done["enemies"] = true
+		mod:chat_broadcast("[Pause] Restore: enemies completed (0 queued)")
 	end
 
 	-- 7. Restore HordeSpawner State (Active & Queued Hordes)
@@ -2113,6 +2138,8 @@ end)
 	if not horde_ok then
 		mod:echo("[Snapshot] Horde restore error: " .. tostring(horde_err))
 	end
+	self._restore_subsystems_done["horde_spawner"] = true
+	mod:chat_broadcast("[Pause] Restore: horde_spawner completed")
 
 	-- 8. Restore Conflict Director Pacing & Horde Timing State
 	local pacing_ok, pacing_err = pcall(function()
@@ -2257,6 +2284,8 @@ end)
 	if not pacing_ok then
 		mod:echo("[Snapshot] Conflict pacing restore error: " .. tostring(pacing_err))
 	end
+	self._restore_subsystems_done["conflict_pacing"] = true
+	mod:chat_broadcast("[Pause] Restore: conflict_pacing completed")
 
 	-- 9. Restore Scoreboard Statistics (Full Rollback to exact snapshot stats & network sync)
 	pcall(function()
@@ -2376,19 +2405,19 @@ end)
 		end
 	end)
 
+	self._restore_subsystems_done["scoreboard"] = true
 	mod:chat_broadcast("[Pause] Restore: scoreboard completed")
-	-- apply_snapshot done; pending queues in update() will announce final completion.
 	return true
 end
 
 --- Update loop for periodic auto-snapshot and level-start detection prompt
 function SnapshotManager:update(dt)
-	-- Pending player equipment/runtime restores
+	-- Pending player equipment/runtime restores (state-based completion, no fixed retry count)
 	local pending = self._pending_player_equipment_restores
 	if pending and #pending > 0 then
 		for i = #pending, 1, -1 do
 			local entry = pending[i]
-			if entry.wait_frames > 0 then
+			if entry.wait_frames and entry.wait_frames > 0 then
 				entry.wait_frames = entry.wait_frames - 1
 			else
 				local player = entry.player
@@ -2397,62 +2426,85 @@ function SnapshotManager:update(dt)
 				if go_id then
 					local ok, equipment_restored = pcall(_restore_player_equipment, unit, entry.player_data, go_id, player.remote, Managers.state.network and Managers.state.network.network_transmit)
 					local runtime_ok, runtime_restored = pcall(_restore_player_runtime_state, unit, entry.player_data, go_id)
-					if ok and equipment_restored and runtime_ok and runtime_restored then
-						entry.remaining_applications = (entry.remaining_applications or 1) - 1
-						if entry.remaining_applications <= 0 then
-							local hero_str = (entry.player_data and entry.player_data.hero_name)
-								or (player.character_name and player:character_name()) or "Player"
-							if not self._restore_logged_players[hero_str] then
-								self._restore_logged_players[hero_str] = true
-								mod:chat_broadcast("[Pause] Restore: player " .. hero_str .. " equipment completed")
-							end
-							table.remove(pending, i)
-						else
-							entry.wait_frames = 1
+					local equip_ok = ok and (equipment_restored == true)
+					local runt_ok  = runtime_ok and (runtime_restored == true)
+
+					if equip_ok and runt_ok then
+						local hero_str = (entry.player_data and entry.player_data.hero_name)
+							or (player.character_name and player:character_name()) or "Player"
+						if not self._restore_logged_players[hero_str] then
+							self._restore_logged_players[hero_str] = true
+							mod:chat_broadcast("[Pause] Restore: player " .. hero_str .. " equipment completed")
 						end
+						table.remove(pending, i)
 					else
 						if not entry.pending_logged then
 							entry.pending_logged = true
 							local hero_str = (entry.player_data and entry.player_data.hero_name)
 								or (player.character_name and player:character_name()) or "Player"
-							mod:chat_broadcast("[Pause] Restore: player " .. hero_str .. " equipment pending - inventory not ready")
+							local reason = (not equip_ok) and "inventory/weapons" or "runtime state"
+							mod:chat_broadcast("[Pause] Restore: player " .. hero_str .. " equipment pending (" .. reason .. " not ready)")
 						end
-						entry.wait_frames = 2
+						entry.wait_frames = 1
 					end
+				else
+					entry.wait_frames = 1
 				end
 			end
 		end
 	end
 
-	-- Pending enemy restores
+	-- Pending enemy restores (state-based completion: go_id, unit, extensions must be verified)
 	local pending_enemies = self._pending_enemy_restores
 	if pending_enemies and #pending_enemies > 0 then
 		local total = self._restore_total_enemies or #pending_enemies
 		for i = #pending_enemies, 1, -1 do
 			local entry      = pending_enemies[i]
 			local enemy_unit = entry.unit_data and entry.unit_data[1]
-			if enemy_unit and Unit.alive(enemy_unit) and _game_object_id_if_ready(enemy_unit) then
-				local restored = pcall(function()
-					if entry.damage_taken > 0 then
-						local health_ext = ScriptUnit.has_extension(enemy_unit, "health_system") and ScriptUnit.extension(enemy_unit, "health_system")
-						if health_ext and health_ext.set_server_damage_taken then
+			local go_id      = enemy_unit and Unit.alive(enemy_unit) and _game_object_id_if_ready(enemy_unit)
+			if go_id then
+				local apply_ok = true
+				local apply_err = nil
+
+				if entry.damage_taken > 0 then
+					local health_ext = ScriptUnit.has_extension(enemy_unit, "health_system") and ScriptUnit.extension(enemy_unit, "health_system")
+					if health_ext and health_ext.set_server_damage_taken then
+						local hp_ok, hp_err = pcall(function()
 							local max_hp   = health_ext:get_max_health()
 							local safe_dmg = math.min(entry.damage_taken, max_hp - 1)
 							if safe_dmg > 0 then
 								health_ext:set_server_damage_taken(safe_dmg)
 							end
+						end)
+						if not hp_ok then
+							apply_ok = false
+							apply_err = hp_err
 						end
+					elseif not health_ext then
+						apply_ok = false
 					end
-					if entry.is_boss then
+				end
+
+				if apply_ok and entry.is_boss then
+					local boss_ok, boss_err = pcall(function()
 						Managers.state.event:trigger("force_add_boss_health_ui", enemy_unit)
 						Managers.state.event:trigger("boss_health_bar_register_unit", enemy_unit, "forced")
+					end)
+					if not boss_ok then
+						apply_ok = false
+						apply_err = boss_err
 					end
-				end)
-				if restored then
+				end
+
+				if apply_ok then
+					table.remove(pending_enemies, i)
+				elseif apply_err then
+					mod:echo("[Pause] Restore: enemy error: " .. tostring(apply_err))
 					table.remove(pending_enemies, i)
 				end
 			end
 		end
+
 		-- Milestone logging every 10%
 		if total > 0 then
 			local done      = total - #pending_enemies
@@ -2464,14 +2516,41 @@ function SnapshotManager:update(dt)
 				mod:chat_broadcast("[Pause] Restore: enemies " .. tostring(done) .. "/" .. tostring(total) .. " (" .. pct_str .. "%)")
 			end
 		end
+
+		if #pending_enemies == 0 and not self._restore_subsystems_done["enemies"] then
+			self._restore_subsystems_done["enemies"] = true
+			mod:chat_broadcast("[Pause] Restore: enemies completed")
+		end
 	end
 
-	-- Completion detection
+	-- Completion detection across all required subsystems
 	local pl_done = not pending or #pending == 0
 	local en_done = not pending_enemies or #pending_enemies == 0
-	if self._restore_state == "restoring" and pl_done and en_done then
-		self._restore_state = "completed"
-		mod:chat_broadcast("[Pause] Restore snapshot completed")
+	if pl_done and not self._restore_subsystems_done["players_async"] then
+		self._restore_subsystems_done["players_async"] = true
+	end
+	if en_done and not self._restore_subsystems_done["enemies"] then
+		self._restore_subsystems_done["enemies"] = true
+	end
+
+	if self._restore_state == "restoring" then
+		local done = self._restore_subsystems_done
+		local all_done = done["snapshot_state"]
+			and done["level_analysis"]
+			and done["missions"]
+			and done["networked_flow"]
+			and done["pickups"]
+			and done["players"]
+			and done["players_async"]
+			and done["enemies"]
+			and done["horde_spawner"]
+			and done["conflict_pacing"]
+			and done["scoreboard"]
+
+		if all_done then
+			self._restore_state = "completed"
+			mod:chat_broadcast("[Pause] Restore snapshot completed")
+		end
 	end
 
 	if not mod.is_in_game() or not Managers.player or not Managers.player.is_server then
