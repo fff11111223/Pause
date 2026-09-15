@@ -1,9 +1,10 @@
--- SnapshotManager for Pause mod
+﻿-- SnapshotManager for Pause mod
 -- Provides robust capture, persistence, and recovery of level progress, seeds, players, enemies, and stats across Host crashes.
 
 local mod = get_mod("Pause")
 
 -- luacheck: globals Managers ScriptWorld Unit ScriptUnit Vector3 Quaternion Vector3Box QuaternionBox Breeds ItemMasterList NetworkLookup cjson ScoreboardHelper BuffUtils
+-- luacheck: globals StatusUtils DamageUtils GameSession NetworkConstants NetworkServer NetworkLookup SpawningHelper LevelHelper Level StatisticsDefinitions PEER_ID_TO_CHANNEL RPC BLACKBOARDS POSITION_LOOKUP
 
 local SnapshotManager = {}
 SnapshotManager.__index = SnapshotManager
@@ -244,7 +245,7 @@ local function _restore_player_runtime_state(pl_unit, pl_data, pl_go_id)
 				-- KNOCKED DOWN STATE: Strictly maintain knocked_down, never overwrite to alive
 				if status_ext then
 					status_ext.dead = false
-					if not status_ext:is_knocked_down() then
+					if pl_go_id and not status_ext:is_knocked_down() then
 						StatusUtils.set_knocked_down_network(pl_unit, true)
 					end
 				end
@@ -260,7 +261,7 @@ local function _restore_player_runtime_state(pl_unit, pl_data, pl_go_id)
 			else
 				-- ALIVE STATE: Strictly maintain alive, never overwrite to knocked down or dead
 				if status_ext then
-					if status_ext:is_knocked_down() then
+					if pl_go_id and status_ext:is_knocked_down() then
 						StatusUtils.set_knocked_down_network(pl_unit, false)
 					end
 					if status_ext:is_dead() then

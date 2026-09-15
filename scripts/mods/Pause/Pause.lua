@@ -1,6 +1,7 @@
-local mod = get_mod("Pause") -- luacheck: ignore get_mod
+﻿local mod = get_mod("Pause") -- luacheck: ignore get_mod
 
 -- luacheck: globals Managers ScriptWorld Unit ScriptUnit Vector3 Quaternion ConflictDirector NetworkServer NetworkLookup GenericCharacterStateMachineExtension SimpleInventoryExtension ActionBase
+-- luacheck: globals GameSession NetworkConstants AILineOfSightExtension PlayerHuskLocomotionExtension TagQueryDatabase BossHealthUI AnimationSystem GameNetworkManager AISystem BLACKBOARDS POSITION_LOOKUP StatisticsDefinitions
 
 local SnapshotManager = mod:dofile("scripts/mods/Pause/snapshot_manager")
 
